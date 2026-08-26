@@ -183,3 +183,48 @@ stub_gh() {
   PATH="$STUB_BIN:$PATH"
   export PATH
 }
+
+# --- Gemini CLI session fixtures ---------------------------------------------
+#
+# Layout mirrors the real one: <sessions>/<project>/chats/session-<stamp>.json
+# holding one JSON object per session, and an optional <project>/.project_root
+# naming the absolute path the project lives at.
+
+# seed_gemini_project <project> <project-root-path>
+seed_gemini_project() {
+  mkdir -p "$WEEKLY_DIGEST_GEMINI_DIR/$1/chats"
+  [ -z "${2:-}" ] || printf '%s' "$2" > "$WEEKLY_DIGEST_GEMINI_DIR/$1/.project_root"
+}
+
+# seed_gemini_session <project> <session-id> <start-date> <json-messages-array>
+# start-date is YYYY-MM-DD; the fixture stamps it at noon UTC, matching the
+# Claude seeders, so the suite's TZ=UTC keeps derived days stable.
+seed_gemini_session() {
+  local proj="$1" sid="$2" date="$3" messages="$4"
+  mkdir -p "$WEEKLY_DIGEST_GEMINI_DIR/$proj/chats"
+  jq -n --arg sid "$sid" --arg start "${date}T12:00:00.000Z" \
+        --argjson msgs "$messages" \
+    '{sessionId:$sid,projectHash:"unused",startTime:$start,
+      lastUpdated:$start,messages:$msgs}' \
+    > "$WEEKLY_DIGEST_GEMINI_DIR/$proj/chats/session-$sid.json"
+}
+
+# gmsg_user <date> <text> — one user message, for the messages array
+gmsg_user() {
+  jq -cn --arg ts "${1}T12:00:00.000Z" --arg t "$2" \
+    '{id:"u",timestamp:$ts,type:"user",content:$t}'
+}
+
+# gmsg_model <date> <model> <output-tokens> <text> — one assistant message
+gmsg_model() {
+  jq -cn --arg ts "${1}T12:00:00.000Z" --arg m "$2" --argjson out "$3" --arg t "$4" \
+    '{id:"g",timestamp:$ts,type:"gemini",model:$m,content:$t,thoughts:null,
+      tokens:{input:10,output:$out,cached:1,thoughts:2,tool:3,
+              total:(10+$out+1+2+3)}}'
+}
+
+# gmsg_error <date> <text> — one error message
+gmsg_error() {
+  jq -cn --arg ts "${1}T12:00:00.000Z" --arg t "$2" \
+    '{id:"e",timestamp:$ts,type:"error",content:$t}'
+}

@@ -950,3 +950,42 @@ seed_cc_week() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"gemini-cli: (unavailable: no such session directory:"* ]]
 }
+
+@test "gemini: an in-window session is reported with its project root as repo" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_g1 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "add the retry"),$(gmsg_model 2026-08-19 gemini-2.5-pro 400 "done")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tool: gemini-cli"* ]]
+  [[ "$output" == *"repo: /work/gproj"* ]]
+  [[ "$output" == *"add the retry"* ]]
+}
+
+@test "gemini: a session with no in-window messages is not reported" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_old 2026-07-01 \
+    "[$(gmsg_user 2026-07-01 "ancient history")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"ancient history"* ]]
+  [[ "$output" == *"no gemini-cli sessions in window"* ]]
+}
+
+@test "gemini: a session started earlier is marked carried over" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_carry 2026-08-10 \
+    "[$(gmsg_user 2026-08-10 "started before"),$(gmsg_user 2026-08-19 "finished during")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"note: CARRIED-OVER from 2026-08-10"* ]]
+}
+
+@test "gemini: a project with no project root and no hash match is unknown" {
+  seed_gemini_project gnoroot ""
+  seed_gemini_session gnoroot ses_nr 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "who am i")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"repo: (unknown)"* ]]
+}

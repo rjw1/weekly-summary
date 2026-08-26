@@ -399,6 +399,27 @@ def tokline: "input=\(.input) output=\(.output) thinking=\(.thinking) "
              + "cache_read=\(.cache_read) cache_write=\(.cache_write)";
 '
 
+# Gemini's own accessors. Its records are one object per message rather than
+# one per content block, so tokens sum directly with no deduplication by id --
+# the trap that makes the Claude side use toks().
+# shellcheck disable=SC2016
+JQ_GEMINI_DEFS='
+# A prompt with any @-referenced files inlined below it. The inlined content is
+# routinely far longer than what was typed, so it is cut here rather than left
+# for the character limit to swallow the actual prompt.
+def gtext: (.content // "")
+  | split("\n--- Content from referenced files ---")[0];
+def gtoks($ms):
+  [$ms[] | select(.type=="gemini") | .tokens // {}]
+  | { input:    (map(.input    // 0) | add // 0),
+      output:   (map(.output   // 0) | add // 0),
+      thoughts: (map(.thoughts // 0) | add // 0),
+      cached:   (map(.cached   // 0) | add // 0),
+      tool:     (map(.tool     // 0) | add // 0) };
+def gtokline: "input=\(.input) output=\(.output) thoughts=\(.thoughts) "
+              + "cached=\(.cached) tool=\(.tool)";
+'
+
 # find is checked as well as jq: claude_candidates discards its stderr, so a
 # missing find would report an empty transcript tree instead of an error, and
 # the week would silently lose every Claude Code session.
@@ -827,12 +848,93 @@ $rows
 EOF
 }
 
-emit_gemini_sessions() {
-  if [ ! -d "$GEMINI_DIR" ]; then
-    printf 'gemini-cli: (unavailable: no such session directory: %s)\n\n' "$GEMINI_DIR"
+# gemini_repo <session-file> -- the absolute project path a session belongs to.
+# Newer project directories carry a .project_root; the hash-named ones do not,
+# and are handled by the lookup added alongside this.
+gemini_repo() {
+  local dir="${1%/chats/*}"
+  if [ -f "$dir/.project_root" ]; then
+    tr -d '\n' < "$dir/.project_root"
     return
   fi
-  printf 'no gemini-cli sessions in window\n\n'
+  printf '(unknown)'
+}
+
+# Candidate sessions. Unlike the append-only Claude transcripts, Gemini
+# rewrites a session file whole on every update, and a restored file can carry
+# an mtime months later than the lastUpdated inside it. That only ever admits
+# a file that turns out to have nothing in window, which gemini_index then
+# discards on the real timestamps -- the prefilter can still never lose one.
+gemini_candidates() {
+  [ -d "$GEMINI_DIR" ] || return 0
+  find "$GEMINI_DIR" -mindepth 3 -maxdepth 3 -type f -name 'session-*.json' \
+    -newermt "$WIN_FROM 00:00:00" 2>/dev/null | sort
+}
+
+# One TSV line per session with in-window activity:
+#   sort-key <TAB> path <TAB> started <TAB> repo <TAB> title
+# startTime is a fixed-width UTC string, so lexicographic order is
+# chronological order. There is no ai-title equivalent, so the title is always
+# the first prompt.
+gemini_index() {
+  local file rows="" line repo
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    repo="$(gemini_repo "$file")"
+    line="$(jq -r --arg from "$WIN_FROM" --arg to "$WIN_TO" --arg path "$file" \
+                  --arg repo "$repo" "
+      $JQ_DEFS
+      $JQ_GEMINI_DEFS
+      . as \$s
+      | [\$s.messages[]? | select(.timestamp != null)] as \$ms
+      | if (\$ms|length) == 0 then empty
+        elif ([\$ms[] | select(inwin(\$from;\$to))] | length) == 0 then empty
+        else
+          (\$s.startTime // \"\") as \$start
+          | ([\$ms[] | select(.type==\"user\") | gtext | clean
+              | select(. != \"\")] | first) as \$prompt1
+          | [\$start, \$path, (\$start|lday), \$repo,
+             ((\$prompt1 // \"(untitled)\") | .[0:80])]
+          | @tsv
+        end" "$file" 2>/dev/null)" || line=""
+    [ -n "$line" ] || continue
+    rows="${rows}${line}"$'\n'
+  done < <(gemini_candidates)
+  [ -z "$rows" ] || printf '%s' "$rows" | sort
+}
+
+emit_gemini_session() {
+  local file="$1" started="$2" repo="$3" title="$4"
+  printf '### %s\n\n' "$title"
+  printf 'tool: gemini-cli\n'
+  printf 'repo: %s\n' "$repo"
+  printf 'started: %s\n' "$started"
+  if [ "$started" \< "$WIN_FROM" ]; then
+    printf 'note: CARRIED-OVER from %s\n' "$started"
+  fi
+  printf '\n'
+}
+
+emit_gemini_sessions() {
+  local rows
+  rows="$(gemini_index)"
+  if [ -z "$rows" ]; then
+    if [ -d "$GEMINI_DIR" ]; then
+      printf 'no gemini-cli sessions in window\n\n'
+    else
+      printf 'gemini-cli: (unavailable: no such session directory: %s)\n\n' "$GEMINI_DIR"
+    fi
+    return
+  fi
+
+  local _key file started repo title
+  # title is read last so a title containing a tab cannot shift the columns.
+  while IFS=$'\t' read -r _key file started repo title; do
+    [ -n "$file" ] || continue
+    emit_gemini_session "$file" "$started" "$repo" "$title"
+  done <<EOF
+$rows
+EOF
 }
 
 # Grouped by tool, opencode first, each group in chronological order. Every
