@@ -903,7 +903,7 @@ seed_cc_week() {
 @test "source: an unknown value is rejected" {
   run "$WD" --from 2026-08-17 --to 2026-08-23 --source vscode
   [ "$status" -ne 0 ]
-  [[ "$output" == *"--source must be opencode, claude or both"* ]]
+  [[ "$output" == *"--source must be opencode, claude, gemini or all"* ]]
 }
 
 @test "source: a claude-only run does not need the opencode database" {
@@ -929,4 +929,24 @@ seed_cc_week() {
   # shellcheck disable=SC2016
   [[ "$output" == *'$BATS_TEST_TMPDIR'* ]]
   [[ "$output" != *'.claude'* ]]
+}
+
+@test "gemini: --source all is the default and both is still accepted" {
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source all
+  [ "$status" -eq 0 ]
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source both
+  [ "$status" -eq 0 ]
+}
+
+@test "gemini: an unknown source names all four accepted values" {
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source nope
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"opencode, claude, gemini or all"* ]]
+}
+
+@test "gemini: a missing session directory is reported as unavailable" {
+  export WEEKLY_DIGEST_GEMINI_DIR="$BATS_TEST_TMPDIR/nope-gemini"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"gemini-cli: (unavailable: no such session directory:"* ]]
 }

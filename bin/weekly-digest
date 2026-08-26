@@ -10,6 +10,7 @@ set -euo pipefail
 
 DB_PATH="${WEEKLY_DIGEST_DB:-$HOME/.local/share/opencode/opencode.db}"
 CLAUDE_DIR="${WEEKLY_DIGEST_CLAUDE_DIR:-$HOME/.claude/projects}"
+GEMINI_DIR="${WEEKLY_DIGEST_GEMINI_DIR:-$HOME/.gemini/tmp}"
 PROGRAM="${0##*/}"
 MAX_CHARS=900
 WEEKS_AGO=1
@@ -19,7 +20,7 @@ FROM=""
 TO=""
 TODAY=""
 USE_GH=1
-SOURCE=both
+SOURCE=all
 WIN_FROM=""
 WIN_TO=""
 WIN_BASIS=""
@@ -67,7 +68,7 @@ usage: weekly-digest [options]
   --week DATE       the Mon-Sun week containing DATE
   --from DATE       start of an explicit range (requires --to)
   --to DATE         end of an explicit range (requires --from)
-  --source WHICH    opencode | claude | both (default both)
+  --source WHICH    opencode | claude | gemini | all (default all)
   --no-gh           skip the pull request lookup
   --max-chars N     truncate prompts and messages (default 900)
   --today DATE      pin "today", for tests
@@ -75,8 +76,9 @@ usage: weekly-digest [options]
 EOF
 }
 
-use_opencode() { [ "$SOURCE" = both ] || [ "$SOURCE" = opencode ]; }
-use_claude()   { [ "$SOURCE" = both ] || [ "$SOURCE" = claude ]; }
+use_opencode() { [ "$SOURCE" = all ] || [ "$SOURCE" = opencode ]; }
+use_claude()   { [ "$SOURCE" = all ] || [ "$SOURCE" = claude ]; }
+use_gemini()   { [ "$SOURCE" = all ] || [ "$SOURCE" = gemini ]; }
 
 parse_args() {
   while [ $# -gt 0 ]; do
@@ -96,9 +98,13 @@ parse_args() {
 
   case "$WEEKS_AGO" in ''|*[!0-9]*) die "--weeks-ago must be a whole number: $WEEKS_AGO" ;; esac
   case "$MAX_CHARS" in ''|*[!0-9]*) die "--max-chars must be a whole number: $MAX_CHARS" ;; esac
+  # 'both' predates the gemini source and meant opencode+claude. It is kept as
+  # an alias for 'all' rather than removed, so existing invocations and habits
+  # do not silently start reporting less than they did.
+  [ "$SOURCE" != both ] || SOURCE=all
   case "$SOURCE" in
-    opencode|claude|both) ;;
-    *) die "--source must be opencode, claude or both: $SOURCE" ;;
+    opencode|claude|gemini|all) ;;
+    *) die "--source must be opencode, claude, gemini or all: $SOURCE" ;;
   esac
 
   [ -z "$WEEK_DATE" ] || valid_date "$WEEK_DATE" || die "--week must be a YYYY-MM-DD date: $WEEK_DATE"
@@ -397,6 +403,16 @@ def tokline: "input=\(.input) output=\(.output) thinking=\(.thinking) "
 # missing find would report an empty transcript tree instead of an error, and
 # the week would silently lose every Claude Code session.
 require_claude_tools() {
+  command -v jq >/dev/null 2>&1 || die "jq is not installed"
+  command -v find >/dev/null 2>&1 || die "find is not installed"
+  jq -n 'now|strflocaltime("%Y")' >/dev/null 2>&1 ||
+    die "this jq has no strflocaltime; jq 1.6 or newer is needed"
+}
+
+# The same two tools the Claude reader needs, and for the same reason:
+# gemini_candidates discards find's stderr, so a missing find would report an
+# empty session tree instead of an error.
+require_gemini_tools() {
   command -v jq >/dev/null 2>&1 || die "jq is not installed"
   command -v find >/dev/null 2>&1 || die "find is not installed"
   jq -n 'now|strflocaltime("%Y")' >/dev/null 2>&1 ||
@@ -811,6 +827,14 @@ $rows
 EOF
 }
 
+emit_gemini_sessions() {
+  if [ ! -d "$GEMINI_DIR" ]; then
+    printf 'gemini-cli: (unavailable: no such session directory: %s)\n\n' "$GEMINI_DIR"
+    return
+  fi
+  printf 'no gemini-cli sessions in window\n\n'
+}
+
 # Grouped by tool, opencode first, each group in chronological order. Every
 # block carries a tool: line, so the groups need no headings of their own and
 # cannot be confused with each other.
@@ -818,6 +842,7 @@ emit_sessions() {
   printf '## sessions\n\n'
   ! use_opencode || emit_sessions_opencode
   ! use_claude   || emit_claude_sessions
+  ! use_gemini   || emit_gemini_sessions
 }
 
 main() {
@@ -828,6 +853,7 @@ main() {
   command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is not installed"
   ! use_opencode || require_db
   ! use_claude   || require_claude_tools
+  ! use_gemini   || require_gemini_tools
 
   [ -z "$WEEK_DATE" ] || calendar_date "$WEEK_DATE" || die "--week is not a real calendar date: $WEEK_DATE"
   [ -z "$TODAY" ]     || calendar_date "$TODAY"     || die "--today is not a real calendar date: $TODAY"

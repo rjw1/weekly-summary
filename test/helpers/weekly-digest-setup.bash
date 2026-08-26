@@ -11,12 +11,14 @@ setup_weekly_digest_env() {
   export WD
   export WEEKLY_DIGEST_DB="$BATS_TEST_TMPDIR/opencode.db"
   export WEEKLY_DIGEST_CLAUDE_DIR="$BATS_TEST_TMPDIR/claude-projects"
+  export WEEKLY_DIGEST_GEMINI_DIR="$BATS_TEST_TMPDIR/gemini-sessions"
   export STUB_BIN="$BATS_TEST_TMPDIR/stub-bin"
   # An existing but empty transcript tree by default: --source defaults to
-  # both, so a test that seeds only the database still exercises the claude
-  # reader, and must find an empty tree rather than a missing one (a missing
-  # directory is reported as unavailable, which is its own test below).
-  mkdir -p "$STUB_BIN" "$WEEKLY_DIGEST_CLAUDE_DIR"
+  # all, so a test that seeds only the database still exercises the claude
+  # and gemini readers, and must find an empty tree rather than a missing one
+  # (a missing directory is reported as unavailable, which is its own test
+  # below).
+  mkdir -p "$STUB_BIN" "$WEEKLY_DIGEST_CLAUDE_DIR" "$WEEKLY_DIGEST_GEMINI_DIR"
   # The digest derives a message's calendar day in local time, from sqlite's
   # 'localtime' on one side and jq's strflocaltime on the other. The fixtures
   # below write timestamps at noon UTC, so pinning the suite to UTC keeps the
