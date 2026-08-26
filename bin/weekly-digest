@@ -339,6 +339,7 @@ emit_stats() {
   printf '## stats\n\n'
   ! use_opencode || emit_stats_opencode
   ! use_claude   || emit_stats_claude
+  ! use_gemini   || emit_stats_gemini
 }
 
 # ----------------------------------------------------------------------------
@@ -974,11 +975,75 @@ gemini_index() {
     [ -n "$line" ] || continue
     rows="${rows}${line}"$'\n'
   done < <(gemini_candidates)
+  # cut, not an awk field list, because a session title may contain tab
+  # characters -- the remaining fields must pass through untouched rather
+  # than be reconstructed from split fields, which would swallow the tabs.
   [ -z "$rows" ] || printf '%s' "$rows" \
     | sort -t $'\t' -k1,1 -k2,2nr -k3,3nr -k5,5r \
     | awk -F'\t' '!seen[$1]++' \
     | cut -f4- \
     | sort
+}
+
+emit_stats_gemini() {
+  printf '### gemini-cli\n\n'
+
+  local rows files=() repos=() _key file started repo title
+  rows="$(gemini_index)"
+  while IFS=$'\t' read -r _key file started repo title; do
+    [ -n "$file" ] || continue
+    files+=("$file")
+    repos+=("$repo")
+  done <<EOF
+$rows
+EOF
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    if [ -d "$GEMINI_DIR" ]; then
+      printf 'sessions: 0\n\n'
+    else
+      printf '(unavailable: no such session directory: %s)\n\n' "$GEMINI_DIR"
+    fi
+    return
+  fi
+
+  printf 'sessions: %s\n' "${#files[@]}"
+  printf 'cost: (unavailable: Gemini CLI sessions record no cost)\n'
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+    $JQ_DEFS
+    $JQ_GEMINI_DEFS
+    [.[] | .messages[]? | select(inwin(\$from;\$to))] as \$w
+    | \"tokens: \" + (gtoks(\$w) | gtokline)" "${files[@]}"
+
+  printf '\nper-model:\n'
+  printf '  %10s  %s\n' output model
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+    $JQ_DEFS
+    $JQ_GEMINI_DEFS
+    [.[] | .messages[]? | select(inwin(\$from;\$to) and .type==\"gemini\")]
+    | group_by(.model // \"(unknown)\")
+    | map({ model: (.[0].model // \"(unknown)\"), out: (gtoks(.) | .output) })
+    | sort_by(-.out)[]
+    | \"  \" + (.out|tostring|(\"          \" + .)[-10:]) + \"  \" + .model" "${files[@]}"
+
+  # One jq call per session, summed in bash by repo, because the repo is not a
+  # field of the session JSON -- it comes from the sibling .project_root or the
+  # hash lookup, both resolved before jq ever sees the file.
+  printf '\nper-repo:\n'
+  printf '  %10s  %s\n' output repo
+  local i out totals=""
+  for i in "${!files[@]}"; do
+    out="$(jq -r --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+      $JQ_DEFS
+      $JQ_GEMINI_DEFS
+      [.messages[]? | select(inwin(\$from;\$to))] | gtoks(.) | .output" "${files[$i]}")"
+    totals="${totals}${repos[$i]}"$'\t'"${out}"$'\n'
+  done
+  printf '%s' "$totals" | awk -F'\t' '
+    NF == 2 { sum[$1] += $2 }
+    END { for (r in sum) printf "%10d  %s\n", sum[r], r }' | sort -rn |
+    sed 's/^/  /'
+  printf '\n'
 }
 
 emit_gemini_session() {

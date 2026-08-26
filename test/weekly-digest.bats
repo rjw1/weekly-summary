@@ -1187,3 +1187,36 @@ $big")]"
   [[ "$output" == *"first session prompt"* ]]
   [[ "$output" == *"second session prompt"* ]]
 }
+
+@test "gemini: stats report sessions, unavailable cost and token totals" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_s1 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "one"),$(gmsg_model 2026-08-19 gemini-2.5-pro 400 "done")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"### gemini-cli"* ]]
+  [[ "$output" == *"sessions: 1"* ]]
+  [[ "$output" == *"cost: (unavailable: Gemini CLI sessions record no cost)"* ]]
+  [[ "$output" == *"output=400"* ]]
+}
+
+@test "gemini: stats break tokens down by model and by repo" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_project gother /work/gother
+  seed_gemini_session gproj ses_m1 2026-08-19 \
+    "[$(gmsg_model 2026-08-19 gemini-2.5-pro 400 "a")]"
+  seed_gemini_session gother ses_m2 2026-08-19 \
+    "[$(gmsg_model 2026-08-19 gemini-2.5-flash 100 "b")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"per-model:"* ]]
+  [[ "$output" == *"gemini-2.5-pro"* ]]
+  [[ "$output" == *"/work/gother"* ]]
+}
+
+@test "gemini: stats say zero sessions rather than nothing when the tree is empty" {
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"### gemini-cli"* ]]
+  [[ "$output" == *"sessions: 0"* ]]
+}
