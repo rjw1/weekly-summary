@@ -1144,3 +1144,46 @@ $big")]"
   [ "$status" -eq 0 ]
   [[ "$output" == *"note: LIKELY-TRIVIAL"* ]]
 }
+
+@test "gemini: a session duplicated across a rooted and rootless project dir is reported once, attributed to the rooted path" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_project gnoroot ""
+  seed_gemini_session gproj ses_dup 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "add the retry")]"
+  seed_gemini_session gnoroot ses_dup 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "add the retry")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  count="$(printf '%s\n' "$output" | grep -c '^tool: gemini-cli')"
+  [ "$count" -eq 1 ]
+  [[ "$output" == *"repo: /work/gproj"* ]]
+  [[ "$output" != *"repo: (unknown)"* ]]
+}
+
+@test "gemini: a session duplicated with differing message counts keeps the fuller copy" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_project gother /work/gother
+  seed_gemini_session gproj ses_full 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "add the retry"),$(gmsg_user 2026-08-20 "a followup only in the fuller copy")]"
+  seed_gemini_session gother ses_full 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "add the retry")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  count="$(printf '%s\n' "$output" | grep -c '^tool: gemini-cli')"
+  [ "$count" -eq 1 ]
+  [[ "$output" == *"a followup only in the fuller copy"* ]]
+}
+
+@test "gemini: two different sessions in the same project are both still reported" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_a 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "first session prompt")]"
+  seed_gemini_session gproj ses_b 2026-08-20 \
+    "[$(gmsg_user 2026-08-20 "second session prompt")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  count="$(printf '%s\n' "$output" | grep -c '^tool: gemini-cli')"
+  [ "$count" -eq 2 ]
+  [[ "$output" == *"first session prompt"* ]]
+  [[ "$output" == *"second session prompt"* ]]
+}

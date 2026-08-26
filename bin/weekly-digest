@@ -928,8 +928,19 @@ gemini_candidates() {
 # startTime is a fixed-width UTC string, so lexicographic order is
 # chronological order. There is no ai-title equivalent, so the title is always
 # the first prompt.
+#
+# Gemini copied rather than moved session files when it migrated from
+# hash-named project directories to name-named ones, so the same sessionId
+# can turn up under several project directories -- one real session is
+# duplicated nine ways. A raw file count therefore overstates how many
+# sessions actually happened, so this dedups by sessionId (falling back to
+# the path if one is ever missing) before returning, keeping the fullest
+# copy: most in-window messages first, then a directory carrying
+# .project_root (the authoritative repo attribution, unlike a hash-named
+# directory resolved only via the sibling lookup), then the greatest path
+# purely so the choice is deterministic.
 gemini_index() {
-  local file rows="" line repo
+  local file rows="" line repo dir has_root
   # Built here, once, rather than left to gemini_repo's lazy call: each
   # iteration below reads repo via command substitution, which forks a
   # subshell that discards GEMINI_HASH_MAP_BUILT and GEMINI_HASH_MAP on exit,
@@ -939,8 +950,10 @@ gemini_index() {
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     repo="$(gemini_repo "$file")"
+    dir="${file%/chats/*}"
+    if [ -f "$dir/.project_root" ]; then has_root=1; else has_root=0; fi
     line="$(jq -r --arg from "$WIN_FROM" --arg to "$WIN_TO" --arg path "$file" \
-                  --arg repo "$repo" "
+                  --arg repo "$repo" --argjson root "$has_root" "
       $JQ_DEFS
       $JQ_GEMINI_DEFS
       . as \$s
@@ -951,14 +964,21 @@ gemini_index() {
           (\$s.startTime // \"\") as \$start
           | ([\$ms[] | select(.type==\"user\") | gtext | clean
               | select(. != \"\")] | first) as \$prompt1
-          | [\$start, \$path, (\$start|lday), \$repo,
+          | (\$s.sessionId // \$path) as \$sid
+          | ([\$ms[] | select(inwin(\$from;\$to))] | length) as \$inwin
+          | [\$sid, (\$inwin|tostring), (\$root|tostring),
+             \$start, \$path, (\$start|lday), \$repo,
              ((\$prompt1 // \"(untitled)\") | .[0:80])]
           | @tsv
         end" "$file" 2>/dev/null)" || line=""
     [ -n "$line" ] || continue
     rows="${rows}${line}"$'\n'
   done < <(gemini_candidates)
-  [ -z "$rows" ] || printf '%s' "$rows" | sort
+  [ -z "$rows" ] || printf '%s' "$rows" \
+    | sort -t $'\t' -k1,1 -k2,2nr -k3,3nr -k5,5r \
+    | awk -F'\t' '!seen[$1]++' \
+    | cut -f4- \
+    | sort
 }
 
 emit_gemini_session() {
