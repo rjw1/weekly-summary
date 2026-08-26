@@ -1,0 +1,852 @@
+#!/usr/bin/env bash
+#
+# weekly-digest — extract a week of session history as structured facts, for an
+# agent to turn into a written summary. Reads two histories: opencode's sqlite
+# database and Claude Code's JSONL transcripts.
+#
+# See skill/weekly-summary/SKILL.md for the workflow this supports.
+
+set -euo pipefail
+
+DB_PATH="${WEEKLY_DIGEST_DB:-$HOME/.local/share/opencode/opencode.db}"
+CLAUDE_DIR="${WEEKLY_DIGEST_CLAUDE_DIR:-$HOME/.claude/projects}"
+PROGRAM="${0##*/}"
+MAX_CHARS=900
+WEEKS_AGO=1
+WEEKS_AGO_SET=0
+WEEK_DATE=""
+FROM=""
+TO=""
+TODAY=""
+USE_GH=1
+SOURCE=both
+WIN_FROM=""
+WIN_TO=""
+WIN_BASIS=""
+
+# Advisory threshold for the claude-code LIKELY-TRIVIAL note. The opencode side
+# uses cost for this; Claude Code records none, so output tokens stand in.
+TRIVIAL_OUTPUT_TOKENS=2000
+
+die() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+  exit 1
+}
+
+# valid_date — matches YYYY-MM-DD only; does not check calendar validity.
+# Calendar validity is checked separately by calendar_date (see main), once
+# sqlite3 is known to be on PATH. This function exists so a stray quote or
+# other sqlite metacharacter in a date option is caught here with a clear
+# message, instead of leaking a raw sqlite parse error.
+valid_date() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# calendar_date — round-trips a shape-valid YYYY-MM-DD date through sqlite's
+# date() and requires the result be unchanged. sqlite's date() does not
+# reject an impossible calendar date such as 2026-02-30; it silently rolls
+# it forward to 2026-03-02, which would otherwise resolve to a
+# confidently-labelled but wrong window instead of an error.
+calendar_date() {
+  local normalised
+  normalised="$(sqlite3 -batch <<SQL
+SELECT date('$1');
+SQL
+)"
+  [ "$normalised" = "$1" ]
+}
+
+usage() {
+  cat <<'EOF'
+usage: weekly-digest [options]
+
+  --weeks-ago N     complete Mon-Sun week, N weeks back (default 1)
+  --week DATE       the Mon-Sun week containing DATE
+  --from DATE       start of an explicit range (requires --to)
+  --to DATE         end of an explicit range (requires --from)
+  --source WHICH    opencode | claude | both (default both)
+  --no-gh           skip the pull request lookup
+  --max-chars N     truncate prompts and messages (default 900)
+  --today DATE      pin "today", for tests
+  --help            show this
+EOF
+}
+
+use_opencode() { [ "$SOURCE" = both ] || [ "$SOURCE" = opencode ]; }
+use_claude()   { [ "$SOURCE" = both ] || [ "$SOURCE" = claude ]; }
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --weeks-ago) WEEKS_AGO="${2:?--weeks-ago needs a value}"; WEEKS_AGO_SET=1; shift 2 ;;
+      --week)      WEEK_DATE="${2:?--week needs a date}"; shift 2 ;;
+      --from)      FROM="${2:?--from needs a date}"; shift 2 ;;
+      --to)        TO="${2:?--to needs a date}"; shift 2 ;;
+      --max-chars) MAX_CHARS="${2:?--max-chars needs a value}"; shift 2 ;;
+      --today)     TODAY="${2:?--today needs a date}"; shift 2 ;;
+      --source)    SOURCE="${2:?--source needs a value}"; shift 2 ;;
+      --no-gh)     USE_GH=0; shift ;;
+      --help|-h)   usage; exit 0 ;;
+      *)           die "unknown option: $1" ;;
+    esac
+  done
+
+  case "$WEEKS_AGO" in ''|*[!0-9]*) die "--weeks-ago must be a whole number: $WEEKS_AGO" ;; esac
+  case "$MAX_CHARS" in ''|*[!0-9]*) die "--max-chars must be a whole number: $MAX_CHARS" ;; esac
+  case "$SOURCE" in
+    opencode|claude|both) ;;
+    *) die "--source must be opencode, claude or both: $SOURCE" ;;
+  esac
+
+  [ -z "$WEEK_DATE" ] || valid_date "$WEEK_DATE" || die "--week must be a YYYY-MM-DD date: $WEEK_DATE"
+  [ -z "$TODAY" ]     || valid_date "$TODAY"     || die "--today must be a YYYY-MM-DD date: $TODAY"
+  [ -z "$FROM" ]      || valid_date "$FROM"      || die "--from must be a YYYY-MM-DD date: $FROM"
+  [ -z "$TO" ]        || valid_date "$TO"        || die "--to must be a YYYY-MM-DD date: $TO"
+
+  if [ -n "$FROM" ] || [ -n "$TO" ]; then
+    [ -n "$FROM" ] && [ -n "$TO" ] || die "--from and --to must be given together"
+    [ -z "$WEEK_DATE" ] || die "--week cannot be combined with --from/--to"
+  fi
+
+  if [ -n "$WEEK_DATE" ]; then
+    [ "$WEEKS_AGO_SET" -eq 0 ] || die "--week cannot be combined with --weeks-ago"
+    [ -z "$TODAY" ] || die "--week cannot be combined with --today"
+  fi
+}
+
+# Window arithmetic runs in sqlite3 rather than date(1): strftime('%w') treats
+# Sunday as 0, so the +6 %7 shift makes Monday the week start, and the result is
+# identical on every platform. 'localtime' is applied only to 'now' — applying it
+# to an explicit date string would reinterpret that date as UTC midnight and
+# shift it.
+resolve_window() {
+  local anchor basis shift_days=0
+
+  if [ -n "$FROM" ]; then
+    printf '%s\t%s\texplicit --from/--to\n' "$FROM" "$TO"
+    return
+  fi
+
+  if [ -n "$WEEK_DATE" ]; then
+    anchor="date('$WEEK_DATE')"
+    basis="week containing $WEEK_DATE"
+  elif [ -n "$TODAY" ]; then
+    anchor="date('$TODAY')"
+    shift_days=$((WEEKS_AGO * 7))
+    basis="$WEEKS_AGO complete week(s) before $TODAY"
+  else
+    anchor="date('now','localtime')"
+    shift_days=$((WEEKS_AGO * 7))
+    basis="$WEEKS_AGO complete week(s) before today"
+  fi
+
+  sqlite3 -batch <<SQL
+WITH a(d) AS (SELECT $anchor),
+     m(d) AS (SELECT date(d,'-'||((strftime('%w',d)+6)%7)||' days','-$shift_days days') FROM a)
+SELECT (SELECT d FROM m) || char(9) || date((SELECT d FROM m),'+6 days') || char(9) || '$basis';
+SQL
+}
+
+# db_query — run a heredoc query read-only. mode=ro without immutable=1 is
+# deliberate: opencode's real database is in WAL mode with other processes
+# writing to it, and an immutable connection ignores the write-ahead log and
+# silently returns stale data. The bats fixture cannot reproduce that (its
+# WAL is always checkpointed to empty between one-shot connections, so
+# mode=ro and immutable=1 behave identically against it) — see the "guard"
+# test in weekly-digest.bats, which asserts this connection string directly
+# instead of via behaviour.
+db_query() {
+  sqlite3 -readonly -batch "file:${DB_PATH}?mode=ro"
+}
+
+require_db() {
+  [ -f "$DB_PATH" ] || die "no such database: $DB_PATH"
+}
+
+# Text is flattened to a single line: a prompt spanning lines would otherwise be
+# indistinguishable from separate prompts in the output.
+emit_prompts() {
+  local session="$1"
+  db_query <<SQL
+.timeout 5000
+.mode list
+SELECT 'USER: ' || substr(
+         replace(replace(trim(json_extract(p.data,'\$.text')),char(10),' / '),char(13),''),
+         1, $MAX_CHARS)
+FROM part p
+JOIN message m ON m.id = p.message_id
+WHERE m.session_id = '$session'
+  AND json_extract(m.data,'\$.role') = 'user'
+  AND json_extract(p.data,'\$.type') = 'text'
+  AND trim(COALESCE(json_extract(p.data,'\$.text'),'')) <> ''
+  AND date(m.time_created/1000,'unixepoch','localtime')
+      BETWEEN '$WIN_FROM' AND '$WIN_TO'
+ORDER BY m.time_created, m.id, p.id;
+SQL
+}
+
+# Costs are summed from assistant-role messages inside the window, not from
+# session.cost, which is a lifetime total and would charge a carried-over
+# session's earlier weeks to this one.
+session_facts() {
+  local session="$1"
+  db_query <<SQL
+.timeout 5000
+.mode list
+.separator |
+WITH RECURSIVE tree(id) AS (
+  SELECT '$session'
+  UNION ALL
+  SELECT c.id FROM session c JOIN tree t ON c.parent_id = t.id
+),
+in_window AS (
+  SELECT m.session_id, COALESCE(json_extract(m.data,'\$.cost'),0) AS cost,
+         json_extract(m.data,'\$.role') AS role
+  FROM message m
+  WHERE date(m.time_created/1000,'unixepoch','localtime')
+        BETWEEN '$WIN_FROM' AND '$WIN_TO'
+)
+SELECT printf('%.2f',(SELECT COALESCE(sum(cost),0) FROM in_window
+                      WHERE session_id = '$session' AND role = 'assistant')),
+       (SELECT count(*) FROM message m
+        JOIN part p ON p.message_id = m.id
+        WHERE m.session_id = '$session'
+          AND json_extract(m.data,'\$.role') = 'user'
+          AND json_extract(p.data,'\$.type') = 'text'
+          AND trim(COALESCE(json_extract(p.data,'\$.text'),'')) <> ''
+          AND date(m.time_created/1000,'unixepoch','localtime')
+              BETWEEN '$WIN_FROM' AND '$WIN_TO'),
+       (SELECT count(*) FROM tree) - 1,
+       printf('%.2f',(SELECT COALESCE(sum(cost),0) FROM in_window
+                      WHERE session_id IN (SELECT id FROM tree)
+                        AND session_id <> '$session' AND role = 'assistant'));
+SQL
+}
+
+emit_final() {
+  local session="$1"
+  db_query <<SQL
+.timeout 5000
+.mode list
+SELECT 'FINAL: ' || substr(
+         replace(replace(trim(json_extract(p.data,'\$.text')),char(10),' / '),char(13),''),
+         1, $MAX_CHARS)
+FROM part p
+JOIN message m ON m.id = p.message_id
+WHERE m.session_id = '$session'
+  AND json_extract(m.data,'\$.role') = 'assistant'
+  AND json_extract(p.data,'\$.type') = 'text'
+  AND trim(COALESCE(json_extract(p.data,'\$.text'),'')) <> ''
+  AND date(m.time_created/1000,'unixepoch','localtime')
+      BETWEEN '$WIN_FROM' AND '$WIN_TO'
+ORDER BY m.time_created DESC, m.id DESC, p.id DESC
+LIMIT 1;
+SQL
+}
+
+# Tokens are reported per class rather than as one number: cache reads dominate
+# by orders of magnitude, so a combined figure is meaningless.
+emit_stats_opencode() {
+  printf '### opencode\n\n'
+  db_query <<SQL
+.timeout 5000
+.mode list
+-- The active/up root-walk CTE below is duplicated in emit_sessions and must
+-- stay identical there, or the session list and this count will silently
+-- disagree about which sessions are active. active requires a matching
+-- session row (unlike a bare message scan) so that a message referencing a
+-- nonexistent session_id is excluded here just as it is from emit_sessions'
+-- root walk, rather than inflating this count while the session list below
+-- reports nothing for it.
+-- reachable has no counterpart in emit_sessions: that function only ever
+-- lists roots, each of which trivially reached itself, so it gets a
+-- leaf-reaches-a-root filter for free. This function counts active leaves,
+-- not roots, so it needs reachable to apply the same filter explicitly: a
+-- session whose parent_id names a session that does not exist can never
+-- reach a root via the walk, and must not be counted here either, or
+-- "sessions:" and the (empty) list below contradict each other.
+WITH RECURSIVE
+  active AS (
+    SELECT DISTINCT m.session_id AS id
+    FROM message m
+    JOIN session s ON s.id = m.session_id
+    WHERE date(m.time_created/1000,'unixepoch','localtime')
+          BETWEEN '$WIN_FROM' AND '$WIN_TO'
+  ),
+  up(leaf, anc) AS (
+    SELECT id, id FROM active
+    UNION
+    SELECT u.leaf, p.id FROM up u
+      JOIN session c ON c.id = u.anc
+      JOIN session p ON p.id = c.parent_id
+  ),
+  reachable AS (
+    SELECT DISTINCT u.leaf AS id
+    FROM up u
+    JOIN session s ON s.id = u.anc
+    WHERE s.parent_id IS NULL
+  ),
+  win AS (
+    SELECT m.data AS data, COALESCE(json_extract(m.data,'\$.cost'),0) AS c
+    FROM message m
+    WHERE json_extract(m.data,'\$.role') = 'assistant'
+      AND date(m.time_created/1000,'unixepoch','localtime')
+          BETWEEN '$WIN_FROM' AND '$WIN_TO'
+  )
+SELECT line FROM (
+  SELECT 1 AS ord, 'sessions: ' || (SELECT count(*) FROM reachable) AS line
+  UNION ALL SELECT 2, 'root sessions: ' || (
+              SELECT count(DISTINCT u.anc) FROM up u
+              JOIN session s ON s.id = u.anc WHERE s.parent_id IS NULL)
+  UNION ALL SELECT 3, 'cost: ' || printf('%.2f',(SELECT COALESCE(sum(c),0) FROM win))
+  UNION ALL SELECT 4, 'tokens: input='
+              || (SELECT COALESCE(sum(json_extract(data,'\$.tokens.input')),0) FROM win)
+              || ' output='     || (SELECT COALESCE(sum(json_extract(data,'\$.tokens.output')),0) FROM win)
+              || ' reasoning='  || (SELECT COALESCE(sum(json_extract(data,'\$.tokens.reasoning')),0) FROM win)
+              || ' cache_read=' || (SELECT COALESCE(sum(json_extract(data,'\$.tokens.cache.read')),0) FROM win)
+) ORDER BY ord;
+SQL
+
+  printf '\nper-repo:\n'
+  printf '  %8s  %s\n' cost repo
+  db_query <<SQL
+.timeout 5000
+.mode list
+SELECT '  ' || printf('%8.2f',COALESCE(sum(json_extract(m.data,'\$.cost')),0))
+    || '  ' || COALESCE(p.worktree, s.directory)
+FROM message m
+JOIN session s ON s.id = m.session_id
+LEFT JOIN project p ON p.id = s.project_id
+WHERE json_extract(m.data,'\$.role') = 'assistant'
+  AND date(m.time_created/1000,'unixepoch','localtime')
+      BETWEEN '$WIN_FROM' AND '$WIN_TO'
+GROUP BY COALESCE(p.worktree, s.directory)
+ORDER BY sum(json_extract(m.data,'\$.cost')) DESC;
+SQL
+  printf '\n'
+}
+
+emit_stats() {
+  printf '## stats\n\n'
+  ! use_opencode || emit_stats_opencode
+  ! use_claude   || emit_stats_claude
+}
+
+# ----------------------------------------------------------------------------
+# Claude Code transcripts
+#
+# Claude Code keeps no database. Each session is one JSONL file at
+# <projects>/<sanitised-cwd>/<session-id>.jsonl, and the subagents it spawned
+# are sibling files under <projects>/<sanitised-cwd>/<session-id>/subagents/,
+# each with an agent-*.meta.json naming its agent type. A subagent transcript
+# carries the parent's sessionId and isSidechain: true, so it is the analogue of
+# an opencode child session and is attributed to the parent here.
+#
+# Two facts about the format drive the code below and must not be "simplified"
+# away:
+#
+#   1. One assistant *message* is written as several records, one per content
+#      block (thinking, text, each tool_use), and every record repeats the same
+#      message.id and a usage object. Summing per record inflates token counts
+#      severalfold. Records for a message are appended as it streams, with usage
+#      growing, so deduplicating by message.id and keeping the LAST occurrence
+#      yields the completed figure.
+#
+#   2. Timestamps are ISO 8601 UTC with milliseconds, which fromdateiso8601
+#      rejects; the milliseconds are stripped before parsing. strflocaltime then
+#      gives the local calendar day, matching the 'localtime' the opencode
+#      queries apply, so both sources agree on which day a message belongs to.
+# The $-prefixed names below are jq variables bound with --arg, not shell
+# parameters, so this block must stay single-quoted.
+# shellcheck disable=SC2016
+JQ_DEFS='
+def lday: sub("\\.[0-9]+Z$";"Z") | fromdateiso8601 | strflocaltime("%Y-%m-%d");
+def inwin($from;$to): ((.timestamp // "") | tostring) as $t
+  | ($t != "") and (($t|lday) >= $from) and (($t|lday) <= $to);
+def clean: gsub("\r";"") | gsub("\n";" / ") | gsub("\t";" ");
+def blocktext:
+  if (.message.content|type) == "string" then .message.content
+  else ([.message.content[]? | select(.type=="text") | .text] | join(" ")) end;
+# A submitted prompt, as opposed to a tool result or an injected meta message:
+# those are also role "user" but carry no promptSource. origin.kind names the
+# surface a prompt arrived from ("human" when typed, absent under -p/the SDK);
+# task-notification is the machine-generated background-task event and is the
+# one origin excluded here. Any other unfamiliar origin is kept and labelled
+# rather than dropped, so a prompt from a surface added later is never silently
+# lost from the record.
+def realprompt:
+  .type == "user" and (.promptSource != null)
+  and ((.origin.kind // "human") != "task-notification");
+def toks($rs):
+  (reduce ($rs[] | select(.type=="assistant" and .message.usage != null)) as $r
+     ({}; .[$r.message.id] = $r.message.usage))
+  | [.[]]
+  | { input:       (map(.input_tokens // 0) | add // 0),
+      output:      (map(.output_tokens // 0) | add // 0),
+      thinking:    (map(.output_tokens_details.thinking_tokens // 0) | add // 0),
+      cache_read:  (map(.cache_read_input_tokens // 0) | add // 0),
+      cache_write: (map(.cache_creation_input_tokens // 0) | add // 0) };
+def tokline: "input=\(.input) output=\(.output) thinking=\(.thinking) "
+             + "cache_read=\(.cache_read) cache_write=\(.cache_write)";
+'
+
+# find is checked as well as jq: claude_candidates discards its stderr, so a
+# missing find would report an empty transcript tree instead of an error, and
+# the week would silently lose every Claude Code session.
+require_claude_tools() {
+  command -v jq >/dev/null 2>&1 || die "jq is not installed"
+  command -v find >/dev/null 2>&1 || die "find is not installed"
+  jq -n 'now|strflocaltime("%Y")' >/dev/null 2>&1 ||
+    die "this jq has no strflocaltime; jq 1.6 or newer is needed"
+}
+
+# Candidate transcripts. A file whose last write predates the window cannot
+# contain an in-window record, so -newermt skips it without opening it; mtime
+# only ever moves forward, so this can lose nothing. Everything surviving the
+# filter is still checked properly by claude_index.
+claude_candidates() {
+  [ -d "$CLAUDE_DIR" ] || return 0
+  find "$CLAUDE_DIR" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' \
+    -newermt "$WIN_FROM 00:00:00" 2>/dev/null | sort
+}
+
+# One TSV line per session with in-window activity:
+#   sort-key <TAB> path <TAB> started <TAB> repo <TAB> branch <TAB> title
+# Sessions with no in-window record emit nothing. Timestamps are fixed-width
+# UTC strings, so lexicographic min is chronological min.
+claude_index() {
+  local file rows="" line
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    line="$(jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --arg path "$file" "
+      $JQ_DEFS
+      . as \$rs
+      | [\$rs[] | select(.timestamp != null) | .timestamp] as \$ts
+      | if (\$ts|length) == 0 then empty
+        elif ([\$rs[] | select(inwin(\$from;\$to))] | length) == 0 then empty
+        else
+          (\$ts | min) as \$first
+          | ([\$rs[] | select(.type==\"ai-title\") | .aiTitle] | last) as \$aititle
+          | ([\$rs[] | select(realprompt) | blocktext] | first) as \$prompt1
+          | ([\$rs[] | .cwd // empty] | first) as \$cwd
+          | ([\$rs[] | .gitBranch // empty | select(. != \"\")] | last) as \$branch
+          | ((\$aititle // \$prompt1 // \"\") | clean | .[0:80]) as \$title
+          | [\$first, \$path, (\$first|lday), (\$cwd // \"(unknown)\"),
+             (\$branch // \"\"),
+             (if \$title == \"\" then \"(untitled)\" else \$title end)]
+          | @tsv
+        end" "$file" 2>/dev/null)" || line=""
+    [ -n "$line" ] || continue
+    rows="${rows}${line}"$'\n'
+  done < <(claude_candidates)
+  [ -z "$rows" ] || printf '%s' "$rows" | sort
+}
+
+# Subagent totals for one session: count of agent transcripts with in-window
+# activity, their summed output tokens, and the agent types involved.
+claude_sub_facts() {
+  local dir="$1" count=0 output=0 file types="" t
+  [ -d "$dir" ] || { printf '0|0|\n'; return; }
+  for file in "$dir"/*.jsonl; do
+    [ -f "$file" ] || continue
+    local got
+    got="$(jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+      $JQ_DEFS
+      [.[] | select(inwin(\$from;\$to))] as \$w
+      | if (\$w|length) == 0 then \"\" else (toks(\$w) | .output | tostring) end" \
+      "$file" 2>/dev/null)" || got=""
+    [ -n "$got" ] || continue
+    count=$((count + 1))
+    output=$((output + got))
+    t="$(jq -r '.agentType // empty' "${file%.jsonl}.meta.json" 2>/dev/null)" || t=""
+    if [ -n "$t" ] && [[ " $types " != *" $t "* ]]; then
+      types="${types:+$types }$t"
+    fi
+  done
+  printf '%s|%s|%s\n' "$count" "$output" "$types"
+}
+
+# Per-session facts and body. Prompts are the records carrying promptSource,
+# which is what distinguishes a submitted prompt from a tool result or an
+# injected meta message — both of those are also role "user".
+emit_claude_session() {
+  local file="$1" started="$2" repo="$3" branch="$4" title="$5"
+  local dir="${file%.jsonl}" subs subcount suboutput subtypes body
+
+  printf '### %s\n\n' "$title"
+  printf 'tool: claude-code\n'
+  printf 'repo: %s\n' "$repo"
+  [ -z "$branch" ] || printf 'branch: %s\n' "$branch"
+  printf 'started: %s\n' "$started"
+
+  body="$(jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --argjson max "$MAX_CHARS" "
+    $JQ_DEFS
+    [.[] | select(inwin(\$from;\$to))] as \$w
+    | (toks(\$w)) as \$t
+    | ([\$w[] | select(.type==\"assistant\") | .message.model // empty] | unique) as \$models
+    | ([\$w[] | select(realprompt)]) as \$prompts
+    | ([\$prompts[]
+        | ((.promptSource // \"typed\") as \$src
+           | (blocktext | clean | .[0:\$max]) as \$txt
+           | select(\$txt != \"\")
+           | if \$src == \"typed\" then \"USER: \" + \$txt
+             else \"USER[\" + \$src + \"]: \" + \$txt end)]) as \$plines
+    | ([\$w[] | select(.type==\"assistant\")
+        | (blocktext | clean | .[0:\$max]) | select(. != \"\")] | last) as \$final
+    | ([\"tokens: \" + (\$t|tokline),
+        \"models: \" + (if (\$models|length) == 0 then \"(none)\" else (\$models|join(\", \")) end),
+        \"prompts: \" + ((\$plines|length)|tostring),
+        \"output-tokens: \" + (\$t.output|tostring)]
+       + [\"\"] + \$plines
+       + (if \$final == null then [] else [\"FINAL: \" + \$final] end))
+    | .[]" "$file" 2>/dev/null)" || body=""
+
+  subs="$(claude_sub_facts "$dir/subagents")"
+  IFS='|' read -r subcount suboutput subtypes <<EOF
+$subs
+EOF
+
+  # The fact lines are pulled out of the body so they can be printed in a fixed
+  # order alongside the ones bash computes, rather than in whatever order jq
+  # emitted them. prompts and output-tokens feed the notes and are not printed.
+  local prompts=0 out=0 tokens="" models="" kept="" line
+  while IFS= read -r line; do
+    case "$line" in
+      "prompts: "*)       prompts="${line#prompts: }" ;;
+      "output-tokens: "*) out="${line#output-tokens: }" ;;
+      "tokens: "*)        tokens="$line" ;;
+      "models: "*)        models="$line" ;;
+      *)                  kept="${kept}${line}"$'\n' ;;
+    esac
+  done <<EOF
+$body
+EOF
+
+  [ -z "$models" ] || printf '%s\n' "$models"
+  [ -z "$tokens" ] || printf '%s\n' "$tokens"
+  printf 'subagents: %s (output tokens %s)%s\n' "$subcount" "$suboutput" \
+    "${subtypes:+ types: $subtypes}"
+  if [ "$started" \< "$WIN_FROM" ]; then
+    printf 'note: CARRIED-OVER from %s\n' "$started"
+  fi
+  # Advisory only, and fitted to throwaway "just testing" sessions; the agent
+  # decides what to mention. Cost is unavailable here, so the opencode side's
+  # cost test is replaced by an output-token threshold.
+  if [ "$prompts" -le 1 ] && [ "$out" -lt "$TRIVIAL_OUTPUT_TOKENS" ]; then
+    printf 'note: LIKELY-TRIVIAL\n'
+  fi
+  printf '%s\n' "$kept"
+}
+
+emit_stats_claude() {
+  printf '### claude-code\n\n'
+
+  local files=() file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    files+=("$file")
+  done < <(claude_index | cut -f2)
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    if [ -d "$CLAUDE_DIR" ]; then
+      printf 'sessions: 0\n\n'
+    else
+      printf '(unavailable: no such transcript directory: %s)\n\n' "$CLAUDE_DIR"
+    fi
+    return
+  fi
+
+  # Subagent transcripts are included so the totals cover a session's whole
+  # tree, matching the way opencode costs roll up to a root session.
+  local all=("${files[@]}") sub
+  for file in "${files[@]}"; do
+    for sub in "${file%.jsonl}"/subagents/*.jsonl; do
+      [ -f "$sub" ] && all+=("$sub")
+    done
+  done
+
+  printf 'sessions: %s\n' "${#files[@]}"
+  printf 'cost: (unavailable: Claude Code transcripts record no cost)\n'
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+    $JQ_DEFS
+    [.[] | select(inwin(\$from;\$to))] as \$w
+    | \"tokens: \" + (toks(\$w) | tokline)" "${all[@]}"
+
+  # Deduplication by message.id happens per model and per repo group, so a
+  # streamed message is counted once in each breakdown rather than once per
+  # content block.
+  printf '\nper-model:\n'
+  printf '  %10s  %s\n' output model
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+    $JQ_DEFS
+    [.[] | select(inwin(\$from;\$to) and .type==\"assistant\")]
+    | group_by(.message.model // \"(unknown)\")
+    | map({ model: (.[0].message.model // \"(unknown)\"), out: (toks(.) | .output) })
+    | sort_by(-.out)[]
+    | \"  \" + (.out|tostring|(\"          \" + .)[-10:]) + \"  \" + .model" "${all[@]}"
+
+  printf '\nper-repo:\n'
+  printf '  %10s  %s\n' output repo
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+    $JQ_DEFS
+    [.[] | select(inwin(\$from;\$to) and .type==\"assistant\")]
+    | group_by(.cwd // \"(unknown)\")
+    | map({ repo: (.[0].cwd // \"(unknown)\"), out: (toks(.) | .output) })
+    | sort_by(-.out)[]
+    | \"  \" + (.out|tostring|(\"          \" + .)[-10:]) + \"  \" + .repo" "${all[@]}"
+  printf '\n'
+}
+
+emit_claude_sessions() {
+  local rows
+  rows="$(claude_index)"
+  if [ -z "$rows" ]; then
+    if [ -d "$CLAUDE_DIR" ]; then
+      printf 'no claude-code sessions in window\n\n'
+    else
+      printf 'claude-code: (unavailable: no such transcript directory: %s)\n\n' "$CLAUDE_DIR"
+    fi
+    return
+  fi
+
+  local _key file started repo branch title
+  # title is read last so a title containing a tab cannot shift the columns.
+  while IFS=$'\t' read -r _key file started repo branch title; do
+    [ -n "$file" ] || continue
+    emit_claude_session "$file" "$started" "$repo" "$branch" "$title"
+  done <<EOF
+$rows
+EOF
+}
+
+# Discovery is one search call. It finds only pull requests authored by the
+# current user, so one raised by a bot or a colleague and merely fixed here will
+# not appear; the skill tells the agent to mention such a case in prose.
+emit_prs() {
+  printf '## pull requests\n\n'
+
+  if [ "$USE_GH" -eq 0 ]; then
+    printf '(unavailable: --no-gh)\n\n'
+    return
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    printf '(unavailable: gh is not installed)\n\n'
+    return
+  fi
+
+  local rows status=0
+  rows="$(gh search prs --author=@me \
+            --updated="${WIN_FROM}..${WIN_TO}" --limit 100 \
+            --json repository,number,state,createdAt,closedAt,title \
+            --template '{{range .}}{{.repository.nameWithOwner}}|{{.number}}|{{.state}}|{{.createdAt}}|{{.closedAt}}|{{.title}}
+{{end}}' 2>/dev/null)" || status=$?
+
+  if [ "$status" -ne 0 ]; then
+    printf '(unavailable: gh search failed with status %s)\n\n' "$status"
+    return
+  fi
+  if [ -z "$rows" ]; then
+    printf 'none found\n\n'
+    return
+  fi
+
+  local repo num state created closed title class from_d to_d emitted=0
+  while IFS='|' read -r repo num state created closed title; do
+    [ -n "$repo" ] || continue
+    emitted=1
+    from_d="${created%%T*}"
+    to_d="${closed%%T*}"
+
+    # gh search prs reports state lowercase ("merged") while gh pr view
+    # reports it uppercase ("MERGED"); comparing against either casing alone
+    # is fragile, so normalise once and use the flag everywhere below.
+    local is_merged
+    case "$state" in
+      MERGED|merged) is_merged=yes ;;
+      *)             is_merged=no ;;
+    esac
+
+    # ISO dates compare correctly as strings, so no date parsing is needed.
+    # An open PR reports closedAt as 0001-01-01T00:00:00Z, which simply fails
+    # the merged test rather than needing a special case.
+    class="touched-only"
+    if [ ! "$from_d" \< "$WIN_FROM" ] && [ ! "$from_d" \> "$WIN_TO" ]; then
+      class="opened-in-window"
+    elif [ "$is_merged" = yes ] && [ ! "$to_d" \< "$WIN_FROM" ] && [ ! "$to_d" \> "$WIN_TO" ]; then
+      class="merged-in-window"
+    fi
+    printf '%s#%s %s %s %s\n' "$repo" "$num" "$class" "$state" "$title"
+
+    if [ "$is_merged" = no ]; then
+      local extra review merge draft
+      extra="$(gh pr view "$num" --repo "$repo" \
+                 --json reviewDecision,mergeStateStatus,isDraft \
+                 --template '{{.reviewDecision}}|{{.mergeStateStatus}}|{{.isDraft}}' 2>/dev/null)" || extra=""
+      if [ -n "$extra" ]; then
+        IFS='|' read -r review merge draft <<EOF
+$extra
+EOF
+        printf '  review: %s merge: %s draft: %s\n' "$review" "$merge" "$draft"
+      else
+        printf '  review: (lookup failed)\n'
+      fi
+    fi
+  done <<EOF
+$rows
+EOF
+
+  # rows was non-empty but every row failed the repo check above: the loop
+  # is fed by a heredoc rather than a pipe, so it runs in this shell and
+  # $emitted set inside it is still visible here. Without this check that
+  # case prints only the header, indistinguishable from "none found".
+  if [ "$emitted" -eq 0 ]; then
+    printf '(unavailable: could not parse gh output)\n'
+  fi
+  printf '\n'
+}
+
+# Root sessions with any message inside the window. Walks up from each active
+# session to its root, so work done under a session started in an earlier week
+# is still attributed to this one.
+emit_sessions_opencode() {
+  local rows
+  rows="$(db_query <<SQL
+.timeout 5000
+.mode list
+.separator |
+-- The up root-walk CTE below is duplicated in emit_stats and must stay
+-- identical there, or the session list and its counts will silently
+-- disagree about which sessions reach a root. active differs from
+-- emit_stats' version: it is a bare message scan with no join to session,
+-- because the up walk below already excludes a session_id with no matching
+-- session row (the first recursive step's JOIN session c ON c.id = u.anc
+-- has nothing to match). emit_stats also defines a reachable CTE with no
+-- counterpart here: roots below already implies "reached a root" for every
+-- row it lists, so this function needs no separate leaf-reachability filter.
+WITH RECURSIVE
+  active AS (
+    SELECT DISTINCT session_id AS id FROM message
+    WHERE date(time_created/1000,'unixepoch','localtime')
+          BETWEEN '$WIN_FROM' AND '$WIN_TO'
+  ),
+  up(leaf, anc) AS (
+    SELECT id, id FROM active
+    UNION
+    SELECT u.leaf, p.id
+      FROM up u
+      JOIN session c ON c.id = u.anc
+      JOIN session p ON p.id = c.parent_id
+  ),
+  roots AS (
+    SELECT DISTINCT u.anc AS id
+    FROM up u JOIN session s ON s.id = u.anc
+    WHERE s.parent_id IS NULL
+  )
+SELECT s.id,
+       COALESCE(p.worktree, s.directory),
+       date(s.time_created/1000,'unixepoch','localtime'),
+       CASE WHEN date(s.time_created/1000,'unixepoch','localtime') < '$WIN_FROM'
+            THEN 'carried' ELSE 'new' END,
+       s.title
+FROM roots r
+JOIN session s ON s.id = r.id
+LEFT JOIN project p ON p.id = s.project_id
+ORDER BY s.time_created;
+SQL
+)"
+
+  if [ -z "$rows" ]; then
+    local range
+    range="$(db_query <<'SQL'
+.timeout 5000
+.mode list
+SELECT COALESCE(date(min(time_created)/1000,'unixepoch','localtime'),'none')
+       || ' .. ' ||
+       COALESCE(date(max(time_created)/1000,'unixepoch','localtime'),'none')
+FROM message;
+SQL
+)"
+    printf 'no opencode sessions in window (recorded history: %s)\n\n' "$range"
+    return
+  fi
+
+  local id title repo started kind
+  # title is read last so that `read` collects the remainder into it: a session
+  # title containing the field separator would otherwise shift every column.
+  while IFS='|' read -r id repo started kind title; do
+    [ -n "$id" ] || continue
+    printf '### %s\n\n' "$title"
+    printf 'tool: opencode\n'
+    printf 'repo: %s\n' "$repo"
+    printf 'started: %s\n' "$started"
+
+    local facts cost prompts subs subcost
+    facts="$(session_facts "$id")"
+    IFS='|' read -r cost prompts subs subcost <<EOF
+$facts
+EOF
+
+    printf 'cost: %s\n' "$cost"
+    printf 'subagents: %s (cost %s)\n' "$subs" "$subcost"
+    if [ "$kind" = "carried" ]; then
+      printf 'note: CARRIED-OVER from %s\n' "$started"
+    fi
+    # Advisory only. The threshold is fitted to a small sample of throwaway
+    # "just testing" sessions and will misfire; the agent decides what to
+    # mention. cost is always printf '%.2f' formatted, so splitting on the
+    # decimal point is safe.
+    local cost_int="${cost%%.*}" cost_frac="${cost##*.}"
+    if [ "$prompts" -le 1 ] && [ "$cost_int" -eq 0 ] && [ "$cost_frac" -lt 20 ]; then
+      printf 'note: LIKELY-TRIVIAL\n'
+    fi
+    printf '\n'
+    emit_prompts "$id"
+    emit_final "$id"
+    printf '\n'
+  done <<EOF
+$rows
+EOF
+}
+
+# Grouped by tool, opencode first, each group in chronological order. Every
+# block carries a tool: line, so the groups need no headings of their own and
+# cannot be confused with each other.
+emit_sessions() {
+  printf '## sessions\n\n'
+  ! use_opencode || emit_sessions_opencode
+  ! use_claude   || emit_claude_sessions
+}
+
+main() {
+  parse_args "$@"
+  # sqlite3 is required unconditionally: the window arithmetic and the date
+  # validation below run in sqlite even for a claude-only run, so that both
+  # sources resolve identical windows from identical code.
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is not installed"
+  ! use_opencode || require_db
+  ! use_claude   || require_claude_tools
+
+  [ -z "$WEEK_DATE" ] || calendar_date "$WEEK_DATE" || die "--week is not a real calendar date: $WEEK_DATE"
+  [ -z "$TODAY" ]     || calendar_date "$TODAY"     || die "--today is not a real calendar date: $TODAY"
+  [ -z "$FROM" ]      || calendar_date "$FROM"      || die "--from is not a real calendar date: $FROM"
+  [ -z "$TO" ]        || calendar_date "$TO"        || die "--to is not a real calendar date: $TO"
+
+  local win
+  win="$(resolve_window)"
+  [ -n "$win" ] || die "could not resolve the reporting window"
+  IFS=$'\t' read -r WIN_FROM WIN_TO WIN_BASIS <<EOF
+$win
+EOF
+
+  printf '## window\n\n'
+  printf 'from: %s\nto: %s\nbasis: %s\n\n' "$WIN_FROM" "$WIN_TO" "$WIN_BASIS"
+
+  emit_stats
+  emit_prs
+  emit_sessions
+}
+
+main "$@"
