@@ -410,11 +410,16 @@ JQ_GEMINI_DEFS='
 # a plain string most of the time but as an array of text blocks in the
 # majority of real sessions, and those blocks carry no "type" key to select on,
 # so both shapes must be normalised to a string before the cut is applied.
+# split("")[0] on empty input is null, not "" -- an inlineData-only block, an
+# empty array, or absent content would otherwise crash clean downstream, so
+# the fallback is reapplied after the subscript. join(" ") also leaves a
+# trailing space when the marker is its own block, hence the trailing trim.
 def gtext:
   (if (.content|type) == "string" then .content
    elif (.content|type) == "array" then ([.content[]? | .text? // empty] | join(" "))
    else "" end)
-  | split("\n--- Content from referenced files ---")[0];
+  | (split("\n--- Content from referenced files ---")[0] // "")
+  | sub("[[:space:]]+$"; "");
 def gtoks($ms):
   [$ms[] | select(.type=="gemini") | .tokens // {}]
   | { input:    (map(.input    // 0) | add // 0),
@@ -925,6 +930,12 @@ gemini_candidates() {
 # the first prompt.
 gemini_index() {
   local file rows="" line repo
+  # Built here, once, rather than left to gemini_repo's lazy call: each
+  # iteration below reads repo via command substitution, which forks a
+  # subshell that discards GEMINI_HASH_MAP_BUILT and GEMINI_HASH_MAP on exit,
+  # so lazy construction re-walks the whole session root on every rootless
+  # session instead of once per run.
+  gemini_build_hash_map
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     repo="$(gemini_repo "$file")"

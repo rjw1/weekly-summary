@@ -999,6 +999,26 @@ $filler")]"
   [[ "$output" != *"$filler"* ]]
 }
 
+@test "gemini: a session with a text-less array block still reports its other prompt" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_gnotext 2026-08-19 \
+    "[$(gmsg_user_no_text 2026-08-19),$(gmsg_user_blocks 2026-08-19 "the real prompt")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tool: gemini-cli"* ]]
+  [[ "$output" == *"the real prompt"* ]]
+}
+
+@test "gemini: a session with a null-content message still reports its other prompt" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_gnull 2026-08-19 \
+    "[$(gmsg_user_null 2026-08-19),$(gmsg_user 2026-08-19 "the real prompt")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tool: gemini-cli"* ]]
+  [[ "$output" == *"the real prompt"* ]]
+}
+
 @test "gemini: a session with no in-window messages is not reported" {
   seed_gemini_project gproj /work/gproj
   seed_gemini_session gproj ses_old 2026-07-01 \
@@ -1061,8 +1081,8 @@ $filler")]"
   seed_gemini_project "$hash" ""
   seed_gemini_session "$hash" ses_hash 2026-08-19 \
     "[$(gmsg_user 2026-08-19 "legacy work")]"
-  # A PATH holding only the stub dir plus the tools the digest genuinely needs,
-  # so shasum is the single thing missing.
+  # shasum is present on PATH but fails, producing no stdout -- this
+  # exercises the "[ -n \"$hash\" ]" guard, not the "command -v shasum" branch.
   printf '#!/bin/sh\nexit 127\n' > "$STUB_BIN/shasum"
   chmod +x "$STUB_BIN/shasum"
   PATH="$STUB_BIN:$PATH" run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini

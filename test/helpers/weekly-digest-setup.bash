@@ -222,6 +222,19 @@ gmsg_user_blocks() {
     '{id:"u",timestamp:$ts,type:"user",content:[{text:$t}]}'
 }
 
+# gmsg_user_no_text <date> — a user message whose content is an array of
+# blocks with no .text (e.g. inlineData-only, a screenshot with no caption).
+gmsg_user_no_text() {
+  jq -cn --arg ts "${1}T12:00:00.000Z" \
+    '{id:"u",timestamp:$ts,type:"user",content:[{inlineData:{}}]}'
+}
+
+# gmsg_user_null <date> — a user message with content explicitly null.
+gmsg_user_null() {
+  jq -cn --arg ts "${1}T12:00:00.000Z" \
+    '{id:"u",timestamp:$ts,type:"user",content:null}'
+}
+
 # gmsg_model <date> <model> <output-tokens> <text> — one assistant message
 gmsg_model() {
   jq -cn --arg ts "${1}T12:00:00.000Z" --arg m "$2" --argjson out "$3" --arg t "$4" \
