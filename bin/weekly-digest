@@ -848,16 +848,57 @@ $rows
 EOF
 }
 
+GEMINI_HASH_MAP=""
+GEMINI_HASH_MAP_BUILT=0
+
+# Legacy project directories are named sha256(<absolute project path>) and
+# carry no .project_root. Hashing every path that IS recorded, anywhere under
+# the session root, recovers the ones whose project is still known from another
+# directory; projects that only ever existed in the hash era stay unattributed.
+# Built at most once per run: it walks the whole session root.
+gemini_build_hash_map() {
+  [ "$GEMINI_HASH_MAP_BUILT" -eq 0 ] || return 0
+  GEMINI_HASH_MAP_BUILT=1
+  # Attribution is a nicety, not the report. A host without shasum loses the
+  # legacy directories' repo names and keeps everything else.
+  command -v shasum >/dev/null 2>&1 || return 0
+  local root path hash
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    path="$(tr -d '\n' < "$root")"
+    [ -n "$path" ] || continue
+    hash="$(printf '%s' "$path" | shasum -a 256 2>/dev/null | cut -d' ' -f1)"
+    [ -n "$hash" ] || continue
+    GEMINI_HASH_MAP="${GEMINI_HASH_MAP}${hash} ${path}"$'\n'
+  done < <(find "$GEMINI_DIR" -mindepth 2 -maxdepth 2 -name .project_root -type f 2>/dev/null)
+}
+
+# gemini_hash_lookup <dirname> -- the project path a hash-named directory
+# stands for, or nothing.
+gemini_hash_lookup() {
+  gemini_build_hash_map
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "$1 "*) printf '%s' "${line#* }"; return 0 ;;
+    esac
+  done <<EOF
+$GEMINI_HASH_MAP
+EOF
+  return 1
+}
+
 # gemini_repo <session-file> -- the absolute project path a session belongs to.
 # Newer project directories carry a .project_root; the hash-named ones do not,
 # and are handled by the lookup added alongside this.
 gemini_repo() {
-  local dir="${1%/chats/*}"
+  local dir="${1%/chats/*}" name
   if [ -f "$dir/.project_root" ]; then
     tr -d '\n' < "$dir/.project_root"
     return
   fi
-  printf '(unknown)'
+  name="${dir##*/}"
+  gemini_hash_lookup "$name" || printf '(unknown)'
 }
 
 # Candidate sessions. Unlike the append-only Claude transcripts, Gemini

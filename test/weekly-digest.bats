@@ -989,3 +989,46 @@ seed_cc_week() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"repo: (unknown)"* ]]
 }
+
+@test "gemini: a hash-named project is attributed from a sibling project root" {
+  local path=/work/hashed
+  local hash
+  hash="$(printf '%s' "$path" | shasum -a 256 | cut -d' ' -f1)"
+  # A sibling project records the same path, which is what makes the hash
+  # resolvable; the hash-named directory itself carries no .project_root.
+  seed_gemini_project sibling "$path"
+  seed_gemini_project "$hash" ""
+  seed_gemini_session "$hash" ses_hash 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "legacy work")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"repo: /work/hashed"* ]]
+  [[ "$output" != *"repo: $hash"* ]]
+}
+
+@test "gemini: a hash-named project with no known path stays unknown" {
+  local hash
+  hash="$(printf '%s' /work/never-recorded | shasum -a 256 | cut -d' ' -f1)"
+  seed_gemini_project "$hash" ""
+  seed_gemini_session "$hash" ses_lost 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "orphan")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"repo: (unknown)"* ]]
+}
+
+@test "gemini: a missing shasum degrades to unknown rather than failing" {
+  local path=/work/hashed hash
+  hash="$(printf '%s' "$path" | shasum -a 256 | cut -d' ' -f1)"
+  seed_gemini_project sibling "$path"
+  seed_gemini_project "$hash" ""
+  seed_gemini_session "$hash" ses_hash 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "legacy work")]"
+  # A PATH holding only the stub dir plus the tools the digest genuinely needs,
+  # so shasum is the single thing missing.
+  printf '#!/bin/sh\nexit 127\n' > "$STUB_BIN/shasum"
+  chmod +x "$STUB_BIN/shasum"
+  PATH="$STUB_BIN:$PATH" run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"repo: (unknown)"* ]]
+}
