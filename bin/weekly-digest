@@ -406,8 +406,14 @@ def tokline: "input=\(.input) output=\(.output) thinking=\(.thinking) "
 JQ_GEMINI_DEFS='
 # A prompt with any @-referenced files inlined below it. The inlined content is
 # routinely far longer than what was typed, so it is cut here rather than left
-# for the character limit to swallow the actual prompt.
-def gtext: (.content // "")
+# for the character limit to swallow the actual prompt. User content arrives as
+# a plain string most of the time but as an array of text blocks in the
+# majority of real sessions, and those blocks carry no "type" key to select on,
+# so both shapes must be normalised to a string before the cut is applied.
+def gtext:
+  (if (.content|type) == "string" then .content
+   elif (.content|type) == "array" then ([.content[]? | .text? // empty] | join(" "))
+   else "" end)
   | split("\n--- Content from referenced files ---")[0];
 def gtoks($ms):
   [$ms[] | select(.type=="gemini") | .tokens // {}]

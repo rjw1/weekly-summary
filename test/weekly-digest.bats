@@ -962,6 +962,43 @@ seed_cc_week() {
   [[ "$output" == *"add the retry"* ]]
 }
 
+@test "gemini: an array-content user message's prompt text is visible" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_gblk 2026-08-19 \
+    "[$(gmsg_user_blocks 2026-08-19 "address the PR comments")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tool: gemini-cli"* ]]
+  [[ "$output" == *"address the PR comments"* ]]
+}
+
+@test "gemini: a session mixing string and array user content reports both" {
+  seed_gemini_project gp1 /work/gp1
+  seed_gemini_project gp2 /work/gp2
+  seed_gemini_session gp1 ses_gstr 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "string content prompt")]"
+  seed_gemini_session gp2 ses_gblk 2026-08-19 \
+    "[$(gmsg_user_blocks 2026-08-19 "array content prompt")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"string content prompt"* ]]
+  [[ "$output" == *"array content prompt"* ]]
+}
+
+@test "gemini: the referenced-files marker is cut from array-block content" {
+  seed_gemini_project gproj /work/gproj
+  local filler
+  filler="$(printf 'x%.0s' {1..200})"
+  seed_gemini_session gproj ses_gcut 2026-08-19 \
+    "[$(gmsg_user_blocks 2026-08-19 "typed prompt
+--- Content from referenced files ---
+$filler")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"typed prompt"* ]]
+  [[ "$output" != *"$filler"* ]]
+}
+
 @test "gemini: a session with no in-window messages is not reported" {
   seed_gemini_project gproj /work/gproj
   seed_gemini_session gproj ses_old 2026-07-01 \

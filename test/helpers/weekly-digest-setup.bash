@@ -215,6 +215,13 @@ gmsg_user() {
     '{id:"u",timestamp:$ts,type:"user",content:$t}'
 }
 
+# gmsg_user_blocks <date> <text> — a user message whose content is an array of
+# text blocks, which is the majority shape in real Gemini data.
+gmsg_user_blocks() {
+  jq -cn --arg ts "${1}T12:00:00.000Z" --arg t "$2" \
+    '{id:"u",timestamp:$ts,type:"user",content:[{text:$t}]}'
+}
+
 # gmsg_model <date> <model> <output-tokens> <text> — one assistant message
 gmsg_model() {
   jq -cn --arg ts "${1}T12:00:00.000Z" --arg m "$2" --argjson out "$3" --arg t "$4" \
