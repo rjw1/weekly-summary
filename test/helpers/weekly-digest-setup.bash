@@ -196,6 +196,14 @@ seed_gemini_project() {
   [ -z "${2:-}" ] || printf '%s' "$2" > "$WEEKLY_DIGEST_GEMINI_DIR/$1/.project_root"
 }
 
+# gemini_session_file <project> <session-id> — the path seed_gemini_session
+# writes to. A test that needs to corrupt a seeded session asks for the path
+# here rather than reaching for WEEKLY_DIGEST_GEMINI_DIR itself: read inside a
+# @test body, that variable trips SC2031, since another test exports it.
+gemini_session_file() {
+  printf '%s/%s/chats/session-%s.json' "$WEEKLY_DIGEST_GEMINI_DIR" "$1" "$2"
+}
+
 # seed_gemini_session <project> <session-id> <start-date> <json-messages-array>
 # start-date is YYYY-MM-DD; the fixture stamps it at noon UTC, matching the
 # Claude seeders, so the suite's TZ=UTC keeps derived days stable.
@@ -206,7 +214,7 @@ seed_gemini_session() {
         --argjson msgs "$messages" \
     '{sessionId:$sid,projectHash:"unused",startTime:$start,
       lastUpdated:$start,messages:$msgs}' \
-    > "$WEEKLY_DIGEST_GEMINI_DIR/$proj/chats/session-$sid.json"
+    > "$(gemini_session_file "$proj" "$sid")"
 }
 
 # gmsg_user <date> <text> — one user message, for the messages array
@@ -236,11 +244,15 @@ gmsg_user_null() {
 }
 
 # gmsg_model <date> <model> <output-tokens> <text> — one assistant message
+#
+# cached is left out of the total deliberately: in real Gemini data it is a
+# subset of input rather than an addition to it, so total is
+# input + output + thoughts + tool and cached never joins the sum.
 gmsg_model() {
   jq -cn --arg ts "${1}T12:00:00.000Z" --arg m "$2" --argjson out "$3" --arg t "$4" \
     '{id:"g",timestamp:$ts,type:"gemini",model:$m,content:$t,thoughts:null,
       tokens:{input:10,output:$out,cached:1,thoughts:2,tool:3,
-              total:(10+$out+1+2+3)}}'
+              total:(10+$out+2+3)}}'
 }
 
 # gmsg_error <date> <text> — one error message

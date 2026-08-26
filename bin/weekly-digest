@@ -35,6 +35,13 @@ die() {
   exit 1
 }
 
+# warn — die's recoverable counterpart. It writes to stderr and returns, so a
+# single unreadable file costs its own facts and nothing else; the report on
+# stdout stays exactly what it would have been without that file.
+warn() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+}
+
 # valid_date — matches YYYY-MM-DD only; does not check calendar validity.
 # Calendar validity is checked separately by calendar_date (see main), once
 # sqlite3 is known to be on PATH. This function exists so a stray quote or
@@ -429,6 +436,11 @@ def gtoks($ms):
       thoughts: (map(.thoughts // 0) | add // 0),
       cached:   (map(.cached   // 0) | add // 0),
       tool:     (map(.tool     // 0) | add // 0) };
+# cached is contained within input here, not added to it: across every real
+# Gemini message carrying tokens, total == input + output + thoughts + tool,
+# with cached <= input. The Claude and opencode readers are the opposite way
+# round -- their cache figures sit outside an input that counts uncached input
+# only -- so these columns can be neither summed nor compared across tools.
 def gtokline: "input=\(.input) output=\(.output) thoughts=\(.thoughts) "
               + "cached=\(.cached) tool=\(.tool)";
 '
@@ -488,7 +500,15 @@ claude_index() {
              (\$branch // \"\"),
              (if \$title == \"\" then \"(untitled)\" else \$title end)]
           | @tsv
-        end" "$file" 2>/dev/null)" || line=""
+        end" "$file" 2>/dev/null)" || {
+      # errexit is suppressed inside command substitution, so this status has
+      # to be checked by hand: without it a jq that died on a malformed record
+      # is indistinguishable from a session with nothing in the window, since
+      # both leave $line empty. jq's own message stays suppressed so a
+      # truncated transcript cannot spam the run; this is one line per file.
+      warn "claude-code: jq failed on $file; that session is omitted"
+      line=""
+    }
     [ -n "$line" ] || continue
     rows="${rows}${line}"$'\n'
   done < <(claude_candidates)
@@ -507,7 +527,10 @@ claude_sub_facts() {
       $JQ_DEFS
       [.[] | select(inwin(\$from;\$to))] as \$w
       | if (\$w|length) == 0 then \"\" else (toks(\$w) | .output | tostring) end" \
-      "$file" 2>/dev/null)" || got=""
+      "$file" 2>/dev/null)" || {
+      warn "claude-code: jq failed on $file; its subagent tokens are omitted"
+      got=""
+    }
     [ -n "$got" ] || continue
     count=$((count + 1))
     output=$((output + got))
@@ -552,7 +575,10 @@ emit_claude_session() {
         \"output-tokens: \" + (\$t.output|tostring)]
        + [\"\"] + \$plines
        + (if \$final == null then [] else [\"FINAL: \" + \$final] end))
-    | .[]" "$file" 2>/dev/null)" || body=""
+    | .[]" "$file" 2>/dev/null)" || {
+    warn "claude-code: jq failed on $file; that session block has no body"
+    body=""
+  }
 
   subs="$(claude_sub_facts "$dir/subagents")"
   IFS='|' read -r subcount suboutput subtypes <<EOF
@@ -663,7 +689,9 @@ emit_claude_sessions() {
   fi
 
   local _key file started repo branch title
-  # title is read last so a title containing a tab cannot shift the columns.
+  # No field can shift the columns whatever the read order: every one of them
+  # reaches the row through jq @tsv, which escapes an embedded tab, and clean
+  # has already stripped tabs from the title.
   while IFS=$'\t' read -r _key file started repo branch title; do
     [ -n "$file" ] || continue
     emit_claude_session "$file" "$started" "$repo" "$branch" "$title"
@@ -972,7 +1000,10 @@ gemini_index() {
              \$start, \$path, (\$start|lday), \$repo,
              ((\$prompt1 // \"(untitled)\") | .[0:80])]
           | @tsv
-        end" "$file" 2>/dev/null)" || line=""
+        end" "$file" 2>/dev/null)" || {
+      warn "gemini-cli: jq failed on $file; that session is omitted"
+      line=""
+    }
     [ -n "$line" ] || continue
     rows="${rows}${line}"$'\n'
   done < <(gemini_candidates)
@@ -1080,7 +1111,10 @@ emit_gemini_session() {
         \"output-tokens: \" + (\$t.output|tostring)]
        + [\"\"] + \$plines
        + (if \$final == null then [] else [\"FINAL: \" + \$final] end))
-    | .[]" "$file" 2>/dev/null)" || body=""
+    | .[]" "$file" 2>/dev/null)" || {
+    warn "gemini-cli: jq failed on $file; that session block has no body"
+    body=""
+  }
 
   # The fact lines are pulled out of the body so bash can print them in a fixed
   # order alongside the notes it computes. prompts and output-tokens feed the
@@ -1128,7 +1162,9 @@ emit_gemini_sessions() {
   fi
 
   local _key file started repo title
-  # title is read last so a title containing a tab cannot shift the columns.
+  # The read order protects nothing and does not need to: clean strips tabs
+  # from the title, and jq @tsv escapes any tab reaching a row from $repo,
+  # which is the one field that could carry one (see gemini_index).
   while IFS=$'\t' read -r _key file started repo title; do
     [ -n "$file" ] || continue
     emit_gemini_session "$file" "$started" "$repo" "$title"

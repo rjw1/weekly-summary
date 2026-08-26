@@ -891,13 +891,37 @@ seed_cc_week() {
   [[ "$output" != *"Inside the window"* ]]
 }
 
-@test "source: both reports each session under its own tool" {
+# All three readers, with no --source at all: the default is the invocation a
+# weekly review actually uses, so a reader dropped out of it must fail here.
+@test "source: the default reports every tool under its own name" {
   seed_week
   seed_cc_week
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_dflt 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "default source gemini prompt")]"
   run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh
   [ "$status" -eq 0 ]
   [[ "$output" == *"tool: opencode"* ]]
   [[ "$output" == *"tool: claude-code"* ]]
+  [[ "$output" == *"tool: gemini-cli"* ]]
+  [[ "$output" == *"### gemini-cli"* ]]
+  [[ "$output" == *"default source gemini prompt"* ]]
+}
+
+@test "source: gemini omits the opencode and claude-code sections entirely" {
+  seed_week
+  seed_cc_week
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_gonly 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "gemini only prompt")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"### gemini-cli"* ]]
+  [[ "$output" == *"gemini only prompt"* ]]
+  [[ "$output" != *"### opencode"* ]]
+  [[ "$output" != *"Inside the window"* ]]
+  [[ "$output" != *"### claude-code"* ]]
+  [[ "$output" != *"Claude session this week"* ]]
 }
 
 @test "source: an unknown value is rejected" {
@@ -932,10 +956,19 @@ seed_cc_week() {
 }
 
 @test "gemini: --source all is the default and both is still accepted" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_src 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "source alias prompt")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tool: gemini-cli"* ]]
+  [[ "$output" == *"source alias prompt"* ]]
   run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source all
   [ "$status" -eq 0 ]
+  [[ "$output" == *"tool: gemini-cli"* ]]
   run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source both
   [ "$status" -eq 0 ]
+  [[ "$output" == *"tool: gemini-cli"* ]]
 }
 
 @test "gemini: an unknown source names all four accepted values" {
@@ -1212,6 +1245,13 @@ $big")]"
   [[ "$output" == *"per-model:"* ]]
   [[ "$output" == *"gemini-2.5-pro"* ]]
   [[ "$output" == *"/work/gother"* ]]
+  # Whole rows, columns included: the substrings above pass even if every
+  # figure is wrong, and both breakdowns render the count in the same
+  # right-aligned 10-wide column.
+  [[ "$output" == *$'\n         400  gemini-2.5-pro\n'* ]]
+  [[ "$output" == *$'\n         100  gemini-2.5-flash\n'* ]]
+  [[ "$output" == *$'\n         400  /work/gproj\n'* ]]
+  [[ "$output" == *$'\n         100  /work/gother\n'* ]]
 }
 
 @test "gemini: stats say zero sessions rather than nothing when the tree is empty" {
@@ -1237,4 +1277,29 @@ $big")]"
     f && $1 ~ /^[0-9]+$/ { sum += $1 }
     END { print sum+0 }')"
   [ "$repo_sum" -eq "$total" ]
+}
+
+# A jq that dies mid-file used to be indistinguishable from a week with nothing
+# in it: the reader swallowed the exit status and the empty output read as an
+# empty window. A null startTime is the cheapest trigger -- lday cannot parse
+# it, so jq exits non-zero having printed nothing.
+@test "gemini: a session jq cannot read warns on stderr and the rest still reports" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_ok 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "the readable session")]"
+  seed_gemini_session gproj ses_bad 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "the unreadable session")]"
+  bad="$(gemini_session_file gproj ses_bad)"
+  jq '.startTime = null' "$bad" > "$bad.tmp"
+  mv "$bad.tmp" "$bad"
+
+  run --separate-stderr "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"the readable session"* ]]
+  [[ "$output" == *"sessions: 1"* ]]
+  [[ "$output" != *"the unreadable session"* ]]
+  # The warning is ours, on stderr, naming the tool and the file. Nothing about
+  # it may reach stdout, which is the report.
+  [[ "$stderr" == *"gemini-cli: jq failed on $bad"* ]]
+  [[ "$output" != *"jq failed"* ]]
 }

@@ -104,6 +104,19 @@ than printing a zero, computing an estimate, or quietly implying the week was
 free. The opencode figure is a real cost and must not be presented as a total
 across the three tools.
 
+**The three tools count cache tokens differently, so the `input=` figures are
+not the same measurement.** gemini-cli's `cached` is contained within its
+`input`: `input` is the *total* input including cache hits, and the line adds up
+as `total = input + output + thoughts + tool`. claude-code's `cache_read` and
+opencode's `cache.read` are the other way round — additive, disjoint from an
+`input` that counts uncached input only. So never add gemini's `cached` to its
+`input`, and never set gemini's `input` beside another tool's `input` as though
+they measured the same thing: a real week reads `input=521311809
+cached=456772659` for gemini against 64,539,150 tokens of fresh input, so
+treating the column like claude-code's overstates it eightfold and summing the
+two doubles it. If a report quotes gemini's `input`, say it is total input
+including cache reads.
+
 **Subagents differ in kind.** An opencode subagent is a child session with its
 own cost, reported as `subagents: N (cost X)`. A Claude Code subagent is a
 sidechain transcript, reported as
@@ -115,9 +128,10 @@ at all, which means absence, not zero. They do carry `errors: N`, counting
 in-window error messages — a run that hit quota or tool failures is worth a
 mention in the narrative.
 
-A Claude Code session block also carries `branch:` and `models:`. Use `models:`
-when a week's work was deliberately split across models; do not read a model
-name as a cost signal, since none is recorded.
+`branch:` is the one claude-specific line: a Claude Code session block carries
+it, a gemini-cli block does not. Both carry `models:`. Use `models:` when a
+week's work was deliberately split across models; do not read a model name as a
+cost signal, since none is recorded.
 
 ## Checking the pull request section
 
