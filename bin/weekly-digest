@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # weekly-digest — extract a week of session history as structured facts, for an
-# agent to turn into a written summary. Reads two histories: opencode's sqlite
-# database and Claude Code's JSONL transcripts.
+# agent to turn into a written summary. Reads three histories: opencode's
+# sqlite database, Claude Code's JSONL transcripts, and Gemini CLI's JSON
+# session files.
 #
 # See skill/weekly-summary/SKILL.md for the workflow this supports.
 

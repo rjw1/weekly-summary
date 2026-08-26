@@ -1,6 +1,6 @@
 ---
 name: weekly-summary
-description: Use when asked to summarise what was done last week, produce a weekly review, or write up a past week's work from opencode or Claude Code session history. Covers running the digest helper, resolving which week is meant, and what the written report must contain.
+description: Use when asked to summarise what was done last week, produce a weekly review, or write up a past week's work from opencode, Claude Code or Gemini CLI session history. Covers running the digest helper, resolving which week is meant, and what the written report must contain.
 ---
 
 # Weekly summary
@@ -8,14 +8,15 @@ description: Use when asked to summarise what was done last week, produce a week
 `bin/weekly-digest` extracts a week of session history as structured facts. This
 skill turns those facts into a written report.
 
-It reads **two** histories and reports both by default:
+It reads **three** histories and reports all of them by default:
 
 - **opencode** — the sqlite database at `~/.local/share/opencode/opencode.db`
 - **claude-code** — the JSONL transcripts under `~/.claude/projects/`
+- **gemini-cli** — the JSON session files under `~/.gemini/tmp/`
 
-**Never query either history directly.** The digest owns the window arithmetic,
+**Never query any history directly.** The digest owns the window arithmetic,
 the activity-based session selection, the cost attribution and the token
-accounting. Hand-rolled queries re-derive those rules and get them wrong. Two
+accounting. Hand-rolled queries re-derive those rules and get them wrong. Four
 traps in particular:
 
 - Filtering opencode sessions on creation date drops work carried over from an
@@ -23,6 +24,16 @@ traps in particular:
 - Claude Code writes one record per *content block* of an assistant message,
   each repeating the same `message.id` and its usage. Summing per record
   inflates token counts severalfold; the digest deduplicates by message id.
+- Gemini names its older project directories with a hash of the project path
+  and records the path nowhere inside the session file. The digest resolves
+  those; a hand-rolled query reports them as unattributed.
+- Gemini also leaves copies of a session in several project directories — it
+  copied rather than moved them when it migrated from hash-named to
+  name-named directories, and one session can appear in as many as nine
+  directories. On the real store, 255 session files hold only 188 distinct
+  sessions. The digest deduplicates by `sessionId`, keeping the fullest copy;
+  a hand-rolled query that counted files would overstate the week's work by
+  36%, and would inflate token totals by the same proportion.
 
 ## Running it
 
@@ -30,10 +41,11 @@ traps in particular:
 ~/git/rjw1/weekly-summary/bin/weekly-digest --weeks-ago 1
 ```
 
-Add `--source opencode` or `--source claude` to restrict the report to one
-tool. The default is `both`, which is what a weekly review normally wants —
-work routinely moves between the two tools inside a single week, and one
-workstream can have sessions in each.
+Add `--source opencode`, `--source claude` or `--source gemini` to restrict the
+report to one tool. The default is `all` — `both` is still accepted as an alias
+for it — and that is what a weekly review normally wants, since work routinely
+moves between tools inside a single week and one workstream can have sessions
+in each.
 
 Map the request onto flags rather than doing date arithmetic yourself:
 
@@ -58,39 +70,50 @@ the digest.
 
 - `## window` — state the resolved dates in the report header.
 - `## stats` — one `###` block per tool: in-window cost and tokens, plus
-  per-repo and (for claude-code) per-model breakdowns.
+  a per-repo breakdown, and (for claude-code and gemini-cli) a per-model one.
 - `## pull requests` — see below. This section is tool-agnostic.
-- `## sessions` — one block per session, grouped by tool, opencode first, each
-  group in chronological order. Every block names its `tool:`, so read that
-  rather than inferring the tool from position.
+- `## sessions` — one block per session, grouped by tool, opencode first, then
+  claude-code, then gemini-cli, each group in chronological order. Every block
+  names its `tool:`, so read that rather than inferring the tool from
+  position.
 
 `note: CARRIED-OVER from <date>` means the session began in an earlier week.
 Say the work continued rather than presenting it as newly started.
 
 `note: LIKELY-TRIVIAL` is advisory and fitted to a small sample. Judge from the
-prompts, not the flag. The opencode side fits it on cost and the claude-code
-side on output tokens, so the two are not directly comparable.
+prompts, not the flag. The opencode side fits it on cost; claude-code and
+gemini-cli both fit it on output tokens, on the same threshold, since neither
+records cost. Opencode's basis is not directly comparable with the other two.
 
 `USER:` is a prompt typed at the terminal. `USER[<source>]:` is one that
 arrived another way — `sdk` for a `claude -p` headless run, and similarly for
 other surfaces. Say so when it matters: a week's `sdk` prompts are usually
 scripted or throwaway rather than deliberate work.
 
-### What the two tools record differently
+A Gemini prompt that referenced files with `@` has the file contents inlined
+beneath it. The digest cuts them off, so a `USER:` line is what was typed, not
+the file that came with it.
 
-**Claude Code records no cost.** Nothing persists spend — `/cost` computes it
-live from token usage — so its stats block reads
-`cost: (unavailable: Claude Code transcripts record no cost)` and its
-breakdowns are in output tokens. Copy that reason into the report rather than
-printing a zero, computing an estimate, or quietly implying the week was free.
-The opencode figure is a real cost and must not be presented as a total across
-both tools.
+### What the tools record differently
+
+**Only opencode records cost.** Claude Code computes spend live from token
+usage and persists none; Gemini CLI records tokens and no cost either. Both
+stats blocks therefore read `cost: (unavailable: …)` with the reason given, and
+their breakdowns are in output tokens. Copy those reasons into the report rather
+than printing a zero, computing an estimate, or quietly implying the week was
+free. The opencode figure is a real cost and must not be presented as a total
+across the three tools.
 
 **Subagents differ in kind.** An opencode subagent is a child session with its
 own cost, reported as `subagents: N (cost X)`. A Claude Code subagent is a
 sidechain transcript, reported as
 `subagents: N (output tokens X) types: <agent types>`. The types are worth a
 mention when a session leaned heavily on one.
+
+**Gemini CLI has no subagents.** Its session blocks carry no `subagents:` line
+at all, which means absence, not zero. They do carry `errors: N`, counting
+in-window error messages — a run that hit quota or tool failures is worth a
+mention in the narrative.
 
 A Claude Code session block also carries `branch:` and `models:`. Use `models:`
 when a week's work was deliberately split across models; do not read a model
@@ -121,16 +144,16 @@ Required sections:
 2. Themed narrative of the work
 3. Pull request table with current state
 4. Outstanding / needs attention
-5. Stats — keep the two tools' figures distinct, and carry across the reason
-   Claude Code reports no cost
+5. Stats — keep the three tools' figures distinct, and carry across the
+   reasons Claude Code and Gemini CLI report no cost
 6. Per-session appendix
 
 ### Narrative rules
 
 - Group by workstream, not by session or by tool. One theme routinely spans
-  several sessions, several days, and both tools; splitting the narrative by
-  tool would break a single piece of work in half. Name the tool only where it
-  is part of the story.
+  several sessions, several days, and more than one tool; splitting the
+  narrative by tool would break a single piece of work in half. Name the tool
+  only where it is part of the story.
 - Say what was done, why, and how it turned out. Include course corrections and
   dead ends where they are informative — mid-session reversals are often the most
   interesting content of a week.

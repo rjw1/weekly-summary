@@ -1221,6 +1221,8 @@ $big")]"
   [[ "$output" == *"sessions: 0"* ]]
 }
 
+# Guard, not a regression test: jq's @tsv already escaped an embedded tab
+# before the hardening this accompanies, so this passes on both sides of it.
 @test "gemini: a tab embedded in the project root does not drop that session from per-repo" {
   seed_gemini_project gtab $'/work/g\trepo'
   seed_gemini_session gtab ses_tab 2026-08-19 \
