@@ -1220,3 +1220,19 @@ $big")]"
   [[ "$output" == *"### gemini-cli"* ]]
   [[ "$output" == *"sessions: 0"* ]]
 }
+
+@test "gemini: a tab embedded in the project root does not drop that session from per-repo" {
+  seed_gemini_project gtab $'/work/g\trepo'
+  seed_gemini_session gtab ses_tab 2026-08-19 \
+    "[$(gmsg_model 2026-08-19 gemini-2.5-pro 400 "t")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  total="$(printf '%s\n' "$output" | grep -oE 'output=[0-9]+' | head -1 | cut -d= -f2)"
+  [ "$total" -eq 400 ]
+  repo_sum="$(printf '%s\n' "$output" | awk '
+    /^per-repo:/ { f=1; next }
+    f && NF == 0 { exit }
+    f && $1 ~ /^[0-9]+$/ { sum += $1 }
+    END { print sum+0 }')"
+  [ "$repo_sum" -eq "$total" ]
+}

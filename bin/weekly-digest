@@ -975,9 +975,11 @@ gemini_index() {
     [ -n "$line" ] || continue
     rows="${rows}${line}"$'\n'
   done < <(gemini_candidates)
-  # cut, not an awk field list, because a session title may contain tab
-  # characters -- the remaining fields must pass through untouched rather
-  # than be reconstructed from split fields, which would swallow the tabs.
+  # cut, not an awk field list, because $repo is not tab-safe: it comes from
+  # tr -d '\n' < .project_root (or the hash lookup), which strips only
+  # newlines, so a tab in that file or in an unusual directory name survives
+  # into the row. The fields must pass through untouched rather than be
+  # reconstructed from split fields, which would misalign across that tab.
   [ -z "$rows" ] || printf '%s' "$rows" \
     | sort -t $'\t' -k1,1 -k2,2nr -k3,3nr -k5,5r \
     | awk -F'\t' '!seen[$1]++' \
@@ -1037,10 +1039,14 @@ EOF
       $JQ_DEFS
       $JQ_GEMINI_DEFS
       [.messages[]? | select(inwin(\$from;\$to))] | gtoks(.) | .output" "${files[$i]}")"
-    totals="${totals}${repos[$i]}"$'\t'"${out}"$'\n'
+    # Count first, repo second: $repo is not tab-safe (see gemini_index), and
+    # putting the number first means a tab embedded in the repo name cannot
+    # shift which field awk treats as the count.
+    totals="${totals}${out}"$'\t'"${repos[$i]}"$'\n'
   done
   printf '%s' "$totals" | awk -F'\t' '
-    NF == 2 { sum[$1] += $2 }
+    NF < 2 { next }
+    { sum[substr($0, index($0, "\t") + 1)] += $1 }
     END { for (r in sum) printf "%10d  %s\n", sum[r], r }' | sort -rn |
     sed 's/^/  /'
   printf '\n'
