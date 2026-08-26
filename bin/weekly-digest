@@ -962,15 +962,65 @@ gemini_index() {
 }
 
 emit_gemini_session() {
-  local file="$1" started="$2" repo="$3" title="$4"
+  local file="$1" started="$2" repo="$3" title="$4" body
+
   printf '### %s\n\n' "$title"
   printf 'tool: gemini-cli\n'
   printf 'repo: %s\n' "$repo"
   printf 'started: %s\n' "$started"
+
+  body="$(jq -r --arg from "$WIN_FROM" --arg to "$WIN_TO" --argjson max "$MAX_CHARS" "
+    $JQ_DEFS
+    $JQ_GEMINI_DEFS
+    [.messages[]? | select(inwin(\$from;\$to))] as \$w
+    | (gtoks(\$w)) as \$t
+    | ([\$w[] | select(.type==\"gemini\") | .model // empty] | unique) as \$models
+    | ([\$w[] | select(.type==\"user\")
+        | (gtext | clean | .[0:\$max]) | select(. != \"\")
+        | \"USER: \" + .]) as \$plines
+    | ([\$w[] | select(.type==\"gemini\")
+        | (gtext | clean | .[0:\$max]) | select(. != \"\")] | last) as \$final
+    | ([\"tokens: \" + (\$t|gtokline),
+        \"models: \" + (if (\$models|length) == 0 then \"(none)\"
+                        else (\$models|join(\", \")) end),
+        \"errors: \" + (([\$w[] | select(.type==\"error\")] | length)|tostring),
+        \"prompts: \" + ((\$plines|length)|tostring),
+        \"output-tokens: \" + (\$t.output|tostring)]
+       + [\"\"] + \$plines
+       + (if \$final == null then [] else [\"FINAL: \" + \$final] end))
+    | .[]" "$file" 2>/dev/null)" || body=""
+
+  # The fact lines are pulled out of the body so bash can print them in a fixed
+  # order alongside the notes it computes. prompts and output-tokens feed the
+  # trivial note and are not printed. There is deliberately no subagents line:
+  # Gemini CLI has no such concept, and printing a zero would read as a session
+  # that happened not to spawn one.
+  local prompts=0 out=0 tokens="" models="" errors="" kept="" line
+  while IFS= read -r line; do
+    case "$line" in
+      "prompts: "*)       prompts="${line#prompts: }" ;;
+      "output-tokens: "*) out="${line#output-tokens: }" ;;
+      "tokens: "*)        tokens="$line" ;;
+      "models: "*)        models="$line" ;;
+      "errors: "*)        errors="$line" ;;
+      *)                  kept="${kept}${line}"$'\n' ;;
+    esac
+  done <<EOF
+$body
+EOF
+
+  [ -z "$models" ] || printf '%s\n' "$models"
+  [ -z "$tokens" ] || printf '%s\n' "$tokens"
+  [ -z "$errors" ] || printf '%s\n' "$errors"
   if [ "$started" \< "$WIN_FROM" ]; then
     printf 'note: CARRIED-OVER from %s\n' "$started"
   fi
-  printf '\n'
+  # Advisory only, and on the same output-token footing as the Claude side,
+  # since Gemini records no cost either.
+  if [ "$prompts" -le 1 ] && [ "$out" -lt "$TRIVIAL_OUTPUT_TOKENS" ]; then
+    printf 'note: LIKELY-TRIVIAL\n'
+  fi
+  printf '%s\n' "$kept"
 }
 
 emit_gemini_sessions() {

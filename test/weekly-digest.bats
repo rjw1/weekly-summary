@@ -1089,3 +1089,58 @@ $filler")]"
   [ "$status" -eq 0 ]
   [[ "$output" == *"repo: (unknown)"* ]]
 }
+
+@test "gemini: a session block carries models, tokens, prompts and a final message" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_full 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "add the retry"),\
+$(gmsg_model 2026-08-19 gemini-2.5-pro 400 "first thought"),\
+$(gmsg_model 2026-08-19 gemini-2.5-pro 350 "all done")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"models: gemini-2.5-pro"* ]]
+  [[ "$output" == *"output=750"* ]]
+  [[ "$output" == *"USER: add the retry"* ]]
+  [[ "$output" == *"FINAL: all done"* ]]
+}
+
+@test "gemini: a session block never claims a subagent count" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_nosub 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "no subagents here")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"subagents:"* ]]
+}
+
+@test "gemini: inlined file content is cut so the typed prompt survives" {
+  seed_gemini_project gproj /work/gproj
+  local big
+  big="$(printf 'x%.0s' $(seq 1 2000))"
+  seed_gemini_session gproj ses_inline 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "check this filter
+--- Content from referenced files ---
+$big")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"USER: check this filter"* ]]
+  [[ "$output" != *"xxxxxxxxxx"* ]]
+}
+
+@test "gemini: error messages in a session are counted" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_err 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "try it"),$(gmsg_error 2026-08-19 "quota exceeded")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"errors: 1"* ]]
+}
+
+@test "gemini: a one-prompt cheap session is flagged likely trivial" {
+  seed_gemini_project gproj /work/gproj
+  seed_gemini_session gproj ses_triv 2026-08-19 \
+    "[$(gmsg_user 2026-08-19 "hi"),$(gmsg_model 2026-08-19 gemini-2.5-flash 5 "hello")]"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"note: LIKELY-TRIVIAL"* ]]
+}
