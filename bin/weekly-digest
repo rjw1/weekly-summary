@@ -30,6 +30,25 @@ WIN_BASIS=""
 # uses cost for this; Claude Code records none, so output tokens stand in.
 TRIVIAL_OUTPUT_TOKENS=2000
 
+# Claude Code records no cost of its own, so its figures are estimated from
+# models.dev's published rates. The table is cached rather than fetched every
+# run: a weekly report has to work on a train, and list prices move far more
+# slowly than reports get written. An estimate is never presented as a billed
+# amount -- see emit_stats_claude for the wording that carries that across.
+PRICING_URL="${WEEKLY_DIGEST_PRICING_URL:-https://models.dev/api.json}"
+PRICING_FILE="${WEEKLY_DIGEST_PRICING:-}"
+PRICING_CACHE="${WEEKLY_DIGEST_PRICING_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/weekly-digest/models-dev.json}"
+PRICING_MAX_AGE_DAYS=30
+USE_PRICING=1
+
+# Populated once by claude_rates, which is why RATES_TRIED exists separately:
+# an empty RATES_JSON is also the outcome when pricing is unavailable, so it
+# cannot double as the "not yet attempted" flag.
+RATES_JSON=""
+RATES_LABEL=""
+RATES_ERROR=""
+RATES_TRIED=0
+
 die() {
   printf '%s: %s\n' "$PROGRAM" "$1" >&2
   exit 1
@@ -78,6 +97,8 @@ usage: weekly-digest [options]
   --to DATE         end of an explicit range (requires --from)
   --source WHICH    opencode | claude | gemini | all (default all)
   --no-gh           skip the pull request lookup
+  --no-pricing      skip the Claude Code cost estimate
+  --pricing FILE    price from a local models.dev api.json instead of fetching
   --max-chars N     truncate prompts and messages (default 900)
   --today DATE      pin "today", for tests
   --help            show this
@@ -99,6 +120,8 @@ parse_args() {
       --today)     TODAY="${2:?--today needs a date}"; shift 2 ;;
       --source)    SOURCE="${2:?--source needs a value}"; shift 2 ;;
       --no-gh)     USE_GH=0; shift ;;
+      --no-pricing) USE_PRICING=0; shift ;;
+      --pricing)   PRICING_FILE="${2:?--pricing needs a path}"; shift 2 ;;
       --help|-h)   usage; exit 0 ;;
       *)           die "unknown option: $1" ;;
     esac
@@ -403,9 +426,49 @@ def toks($rs):
       output:      (map(.output_tokens // 0) | add // 0),
       thinking:    (map(.output_tokens_details.thinking_tokens // 0) | add // 0),
       cache_read:  (map(.cache_read_input_tokens // 0) | add // 0),
-      cache_write: (map(.cache_creation_input_tokens // 0) | add // 0) };
+      cache_write: (map(.cache_creation_input_tokens // 0) | add // 0),
+      cache_write_1h:
+        (map(.cache_creation.ephemeral_1h_input_tokens // 0) | add // 0) };
 def tokline: "input=\(.input) output=\(.output) thinking=\(.thinking) "
              + "cache_read=\(.cache_read) cache_write=\(.cache_write)";
+# Estimated dollars for a set of records, priced from a models.dev rate table
+# in dollars per million tokens. Three details drive this and must not be
+# "simplified" away:
+#
+#   1. thinking tokens are a subset of output tokens, not an addition to them,
+#      so pricing .thinking as well would charge the same tokens twice.
+#   2. models.dev carries a single cache-write rate: the 5-minute one.
+#      Claude Code writes most of its cache with a 1-hour TTL,
+#      charged at twice base input rather than 1.25x, and the transcripts
+#      record the split under cache_creation. Everything not attributed to the
+#      1-hour bucket -- including older records that carry no split at all --
+#      falls back to the models.dev rate, which is right for both.
+#   3. A model absent from the table contributes nothing rather than guessing
+#      a rate. unpriced names those models so the gap is reported instead of
+#      quietly shrinking the total.
+def usd($rs; $rates):
+  ([$rs[] | select(.type=="assistant")]
+   | group_by(.message.model // "(unknown)")
+   | map((.[0].message.model // "(unknown)") as $m
+         | ($rates[$m] // null) as $r
+         | if $r == null then 0
+           else (toks(.)) as $t
+             | ($t.input          * $r.input
+                + $t.output       * $r.output
+                + $t.cache_read   * $r.cache_read
+                + $t.cache_write_1h * ($r.input * 2)
+                + (($t.cache_write - $t.cache_write_1h) * $r.cache_write))
+               / 1000000
+           end)
+   | add // 0);
+def unpriced($rs; $rates):
+  ([$rs[] | select(.type=="assistant")]
+   | group_by(.message.model // "(unknown)")
+   | map(select($rates[(.[0].message.model // "(unknown)")] == null)
+         | select((toks(.)
+                   | .input + .output + .cache_read + .cache_write) > 0)
+         | (.[0].message.model // "(unknown)"))
+   | unique);
 '
 
 # Gemini's own accessors. Its records are one object per message rather than
@@ -444,6 +507,93 @@ def gtoks($ms):
 def gtokline: "input=\(.input) output=\(.output) thoughts=\(.thoughts) "
               + "cached=\(.cached) tool=\(.tool)";
 '
+
+# pricing_cache_fresh — true when the cached table exists and is younger than
+# PRICING_MAX_AGE_DAYS. -mtime is used rather than -newermt because this is a
+# relative age, and it behaves the same on BSD and GNU find.
+pricing_cache_fresh() {
+  [ -f "$PRICING_CACHE" ] || return 1
+  [ -n "$(find "$PRICING_CACHE" -maxdepth 0 -mtime -"$PRICING_MAX_AGE_DAYS" 2>/dev/null)" ]
+}
+
+# fetch_pricing — refresh the cache from models.dev. The download lands on a
+# temporary path and is only moved into place once jq confirms it parses and
+# carries the anthropic block, so a captive-portal HTML page or a truncated
+# transfer can never replace a good cached table with a bad one.
+fetch_pricing() {
+  command -v curl >/dev/null 2>&1 || {
+    RATES_ERROR="curl is not installed and there is no cached table at $PRICING_CACHE"
+    return 1
+  }
+  mkdir -p "${PRICING_CACHE%/*}" 2>/dev/null || true
+  local tmp="$PRICING_CACHE.$$"
+  if ! curl -fsS --max-time 30 -o "$tmp" "$PRICING_URL" 2>/dev/null; then
+    rm -f "$tmp"
+    RATES_ERROR="could not fetch $PRICING_URL"
+    return 1
+  fi
+  if ! jq -e '.anthropic.models' "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    RATES_ERROR="$PRICING_URL returned no anthropic model table"
+    return 1
+  fi
+  mv "$tmp" "$PRICING_CACHE"
+  return 0
+}
+
+# claude_rates — populate RATES_JSON with a model-id to rate mapping, or
+# RATES_ERROR with why it could not be had. Called from both claude emitters
+# and runs its work once; a stale cache is served rather than failing the run,
+# since week-old list prices beat no estimate at all.
+claude_rates() {
+  [ "$RATES_TRIED" -eq 0 ] || return 0
+  RATES_TRIED=1
+
+  if [ "$USE_PRICING" -eq 0 ]; then
+    RATES_ERROR="--no-pricing"
+    return 0
+  fi
+
+  local src=""
+  if [ -n "$PRICING_FILE" ]; then
+    if [ -f "$PRICING_FILE" ]; then
+      src="$PRICING_FILE"
+    else
+      RATES_ERROR="no such pricing file: $PRICING_FILE"
+      return 0
+    fi
+  elif pricing_cache_fresh; then
+    src="$PRICING_CACHE"
+  elif fetch_pricing; then
+    src="$PRICING_CACHE"
+  elif [ -f "$PRICING_CACHE" ]; then
+    # The fetch failed but a stale copy survives. Its age goes in the label, so
+    # a report written from months-old prices says so on its face.
+    src="$PRICING_CACHE"
+    RATES_ERROR=""
+  else
+    return 0
+  fi
+
+  local table
+  table="$(jq -c '
+    [ (.anthropic.models // {}) | to_entries[]
+      | select(.value.cost.input != null and .value.cost.output != null)
+      | { key: .key,
+          value: { input:       .value.cost.input,
+                   output:      .value.cost.output,
+                   cache_read:  (.value.cost.cache_read  // 0),
+                   cache_write: (.value.cost.cache_write // 0) } } ]
+    | from_entries' "$src" 2>/dev/null)" || table=""
+
+  if [ -z "$table" ] || [ "$table" = '{}' ]; then
+    RATES_ERROR="no anthropic rates in $src"
+    return 0
+  fi
+
+  RATES_JSON="$table"
+  RATES_LABEL="models.dev rates from $src, dated $(date -r "$src" +%Y-%m-%d 2>/dev/null || echo unknown)"
+}
 
 # find is checked as well as jq: claude_candidates discards its stderr, so a
 # missing find would report an empty transcript tree instead of an error, and
@@ -542,12 +692,33 @@ claude_sub_facts() {
   printf '%s|%s|%s\n' "$count" "$output" "$types"
 }
 
+# claude_session_cost — estimated dollars for one session together with its
+# subagents, so a session block totals its whole tree the way an opencode root
+# session totals its children. Prints nothing when no rate table was available,
+# which is what keeps the cost line out of the block entirely rather than
+# showing a zero.
+claude_session_cost() {
+  local file="$1" sub
+  local group=("$file")
+  [ -n "$RATES_JSON" ] || return 0
+  for sub in "${file%.jsonl}"/subagents/*.jsonl; do
+    [ -f "$sub" ] && group+=("$sub")
+  done
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --argjson rates "$RATES_JSON" "
+    $JQ_DEFS
+    [.[] | select(inwin(\$from;\$to))] as \$w
+    | usd(\$w;\$rates)" "${group[@]}" 2>/dev/null || true
+}
+
 # Per-session facts and body. Prompts are the records carrying promptSource,
 # which is what distinguishes a submitted prompt from a tool result or an
 # injected meta message — both of those are also role "user".
 emit_claude_session() {
   local file="$1" started="$2" repo="$3" branch="$4" title="$5"
-  local dir="${file%.jsonl}" subs subcount suboutput subtypes body
+  local dir="${file%.jsonl}" subs subcount suboutput subtypes body cost
+
+  claude_rates
+  cost="$(claude_session_cost "$file")"
 
   printf '### %s\n\n' "$title"
   printf 'tool: claude-code\n'
@@ -603,18 +774,43 @@ EOF
 
   [ -z "$models" ] || printf '%s\n' "$models"
   [ -z "$tokens" ] || printf '%s\n' "$tokens"
+  [ -z "$cost" ] || printf 'cost: (estimated %.2f, session and subagents)\n' "$cost"
   printf 'subagents: %s (output tokens %s)%s\n' "$subcount" "$suboutput" \
     "${subtypes:+ types: $subtypes}"
   if [ "$started" \< "$WIN_FROM" ]; then
     printf 'note: CARRIED-OVER from %s\n' "$started"
   fi
   # Advisory only, and fitted to throwaway "just testing" sessions; the agent
-  # decides what to mention. Cost is unavailable here, so the opencode side's
-  # cost test is replaced by an output-token threshold.
+  # decides what to mention. The opencode side tests this on recorded cost;
+  # here the threshold stays on output tokens rather than the estimate, so the
+  # flag means the same thing whether or not a rate table was loaded.
   if [ "$prompts" -le 1 ] && [ "$out" -lt "$TRIVIAL_OUTPUT_TOKENS" ]; then
     printf 'note: LIKELY-TRIVIAL\n'
   fi
   printf '%s\n' "$kept"
+}
+
+# The two breakdown tables gain a cost column only when a rate table was
+# loaded, so --no-pricing and an offline run still produce the output-token
+# tables these blocks have always had rather than a column of zeroes.
+claude_breakdown_header() {
+  if [ -n "$RATES_JSON" ]; then
+    printf '  %10s  %10s  %s\n' 'est cost' output "$1"
+  else
+    printf '  %10s  %s\n' output "$1"
+  fi
+}
+
+claude_breakdown_rows() {
+  local c o k
+  while IFS=$'\t' read -r c o k; do
+    [ -n "$k" ] || continue
+    if [ -n "$RATES_JSON" ]; then
+      printf '  %10.2f  %10d  %s\n' "$c" "$o" "$k"
+    else
+      printf '  %10d  %s\n' "$o" "$k"
+    fi
+  done
 }
 
 emit_stats_claude() {
@@ -645,7 +841,30 @@ emit_stats_claude() {
   done
 
   printf 'sessions: %s\n' "${#files[@]}"
-  printf 'cost: (unavailable: Claude Code transcripts record no cost)\n'
+
+  claude_rates
+  local rates='{}' est unp
+  [ -z "$RATES_JSON" ] || rates="$RATES_JSON"
+  if [ -n "$RATES_JSON" ]; then
+    est="$(jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --argjson rates "$rates" "
+      $JQ_DEFS
+      [.[] | select(inwin(\$from;\$to))] as \$w
+      | usd(\$w;\$rates)" "${all[@]}")"
+    # Worded so the figure cannot be read as a charge: these are list API
+    # prices applied to recorded tokens, which is not what a subscription plan
+    # bills, and the transcripts still record no cost of their own.
+    printf 'cost: (estimated %.2f from models.dev list API pricing, not a billed amount)\n' "$est"
+    printf 'pricing: %s\n' "$RATES_LABEL"
+    unp="$(jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --argjson rates "$rates" "
+      $JQ_DEFS
+      [.[] | select(inwin(\$from;\$to))] as \$w
+      | unpriced(\$w;\$rates) | join(\", \")" "${all[@]}")"
+    [ -z "$unp" ] || printf 'pricing-note: no models.dev rate for %s; those tokens are outside the estimate\n' "$unp"
+  else
+    printf 'cost: (unavailable: Claude Code transcripts record no cost; no estimate: %s)\n' \
+      "${RATES_ERROR:-models.dev pricing could not be read}"
+  fi
+
   jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
     $JQ_DEFS
     [.[] | select(inwin(\$from;\$to))] as \$w
@@ -653,26 +872,32 @@ emit_stats_claude() {
 
   # Deduplication by message.id happens per model and per repo group, so a
   # streamed message is counted once in each breakdown rather than once per
-  # content block.
+  # content block. Both breakdowns sort on estimated cost first and output
+  # tokens second; with no rate table every cost is zero, so the ordering
+  # falls back to exactly the output-token ranking these blocks always had.
   printf '\nper-model:\n'
-  printf '  %10s  %s\n' output model
-  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+  claude_breakdown_header model
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --argjson rates "$rates" "
     $JQ_DEFS
     [.[] | select(inwin(\$from;\$to) and .type==\"assistant\")]
     | group_by(.message.model // \"(unknown)\")
-    | map({ model: (.[0].message.model // \"(unknown)\"), out: (toks(.) | .output) })
-    | sort_by(-.out)[]
-    | \"  \" + (.out|tostring|(\"          \" + .)[-10:]) + \"  \" + .model" "${all[@]}"
+    | map({ k: (.[0].message.model // \"(unknown)\"),
+            out: (toks(.) | .output),
+            usd: usd(.; \$rates) })
+    | sort_by(-.usd, -.out)[]
+    | [(.usd|tostring), (.out|tostring), .k] | @tsv" "${all[@]}" | claude_breakdown_rows
 
   printf '\nper-repo:\n'
-  printf '  %10s  %s\n' output repo
-  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" "
+  claude_breakdown_header repo
+  jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --argjson rates "$rates" "
     $JQ_DEFS
     [.[] | select(inwin(\$from;\$to) and .type==\"assistant\")]
     | group_by(.cwd // \"(unknown)\")
-    | map({ repo: (.[0].cwd // \"(unknown)\"), out: (toks(.) | .output) })
-    | sort_by(-.out)[]
-    | \"  \" + (.out|tostring|(\"          \" + .)[-10:]) + \"  \" + .repo" "${all[@]}"
+    | map({ k: (.[0].cwd // \"(unknown)\"),
+            out: (toks(.) | .output),
+            usd: usd(.; \$rates) })
+    | sort_by(-.usd, -.out)[]
+    | [(.usd|tostring), (.out|tostring), .k] | @tsv" "${all[@]}" | claude_breakdown_rows
   printf '\n'
 }
 

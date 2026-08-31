@@ -13,6 +13,11 @@ setup_weekly_digest_env() {
   export WEEKLY_DIGEST_CLAUDE_DIR="$BATS_TEST_TMPDIR/claude-projects"
   export WEEKLY_DIGEST_GEMINI_DIR="$BATS_TEST_TMPDIR/gemini-sessions"
   export STUB_BIN="$BATS_TEST_TMPDIR/stub-bin"
+  # Both pricing paths are pinned inside the tmpdir: WEEKLY_DIGEST_PRICING so
+  # no test reaches models.dev over the network, and the cache path so none can
+  # write the developer's real cache even if a test clears the first.
+  export WEEKLY_DIGEST_PRICING="$BATS_TEST_TMPDIR/models-dev.json"
+  export WEEKLY_DIGEST_PRICING_CACHE="$BATS_TEST_TMPDIR/pricing-cache.json"
   # An existing but empty transcript tree by default: --source defaults to
   # all, so a test that seeds only the database still exercises the claude
   # and gemini readers, and must find an empty tree rather than a missing one
@@ -29,6 +34,31 @@ setup_weekly_digest_env() {
   # emit_sessions, so window-only tests need a real (if empty) fixture to
   # query even when they never seed a session.
   make_fixture_db "$WEEKLY_DIGEST_DB"
+  make_fixture_pricing "$WEEKLY_DIGEST_PRICING"
+}
+
+# make_fixture_pricing <path> — a models.dev api.json cut down to the Anthropic
+# models the fixtures use, carrying their real published rates in dollars per
+# million tokens. Real rates rather than round invented ones, so a test that
+# asserts a figure is also a check that the arithmetic matches the source.
+make_fixture_pricing() {
+  cat > "$1" <<'PRICING'
+{
+  "anthropic": {
+    "models": {
+      "claude-opus-5": {
+        "cost": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}
+      },
+      "claude-sonnet-5": {
+        "cost": {"input": 2, "output": 10, "cache_read": 0.2, "cache_write": 2.5}
+      },
+      "claude-haiku-4-5-20251001": {
+        "cost": {"input": 1, "output": 5, "cache_read": 0.1, "cache_write": 1.25}
+      }
+    }
+  }
+}
+PRICING
 }
 
 # make_fixture_db <path> — creates the schema once. Called from
@@ -156,6 +186,22 @@ seed_cc_assistant() {
                usage:{input_tokens:10,output_tokens:$out,
                       cache_read_input_tokens:100,cache_creation_input_tokens:5,
                       output_tokens_details:{thinking_tokens:2}}}}' \
+    | cc_append "$proj" "$sid"
+}
+
+# seed_cc_usage <project> <session-id> <cwd> <date> <model> <message-id> <usage>
+# One assistant record whose usage object is given verbatim, for the pricing
+# tests: those need exact token counts, where seed_cc_assistant hardcodes a
+# fixed spread chosen to exercise the token columns.
+seed_cc_usage() {
+  local proj="$1" sid="$2" cwd="$3" date="$4" model="$5" mid="$6" usage="$7"
+  jq -cn --arg sid "$sid" --arg cwd "$cwd" --arg ts "${date}T12:00:00.000Z" \
+         --arg model "$model" --arg mid "$mid" --argjson usage "$usage" \
+    '{type:"assistant",sessionId:$sid,cwd:$cwd,gitBranch:"main",timestamp:$ts,
+      isSidechain:false,
+      message:{id:$mid,role:"assistant",model:$model,
+               content:[{type:"text",text:"priced answer"}],
+               usage:$usage}}' \
     | cc_append "$proj" "$sid"
 }
 

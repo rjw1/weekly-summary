@@ -16,6 +16,17 @@ It reads three histories:
 bin/weekly-digest --weeks-ago 1
 ```
 
+## Cost
+
+opencode records what a session cost; Claude Code and Gemini CLI do not. The
+Claude Code figures are therefore estimated by pricing the tokens its
+transcripts record against [models.dev](https://models.dev) published rates,
+cached under `~/.cache/weekly-digest/` and refreshed when older than 30 days.
+The estimate applies list API prices, so it is not what a subscription plan
+charges, and the digest labels it that way wherever it appears. `--no-pricing`
+skips it; `--pricing FILE` prices from a local models.dev `api.json`. With no
+network and no cache, the cost is reported as unavailable rather than zero.
+
 ## Reports
 
 Reports are written to `~/weekly-summaries/`, which is deliberately **not** a

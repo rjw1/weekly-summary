@@ -817,11 +817,149 @@ seed_cc_week() {
   [[ "$output" == *"subagents: 0 (output tokens 0)"* ]]
 }
 
-@test "claude: stats state that no cost is recorded rather than reporting zero" {
-  seed_cc_week
-  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh
+@test "claude: stats estimate cost from the models.dev rate table" {
+  seed_cc_title cc-alpha ses_p1 "Priced session"
+  seed_cc_prompt cc-alpha ses_p1 /work/alpha 2026-08-19 "cost me"
+  seed_cc_usage cc-alpha ses_p1 /work/alpha 2026-08-19 claude-opus-5 msg_p1 \
+    '{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
   [ "$status" -eq 0 ]
-  [[ "$output" == *"cost: (unavailable: Claude Code transcripts record no cost)"* ]]
+  [[ "$output" == *"cost: (estimated 25.00 from models.dev list API pricing, not a billed amount)"* ]]
+  [[ "$output" == *"pricing: models.dev rates from"* ]]
+}
+
+@test "claude: the estimate never presents itself as a billed amount" {
+  seed_cc_week
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not a billed amount"* ]]
+}
+
+@test "claude: input, cache reads and cache writes are all priced" {
+  seed_cc_title cc-alpha ses_p2 "Every column"
+  seed_cc_prompt cc-alpha ses_p2 /work/alpha 2026-08-19 "cost me"
+  # opus-5: 1M input at 5, 1M cache read at 0.5, 1M untagged cache write at
+  # 6.25, no output -- 11.75 in total.
+  seed_cc_usage cc-alpha ses_p2 /work/alpha 2026-08-19 claude-opus-5 msg_p2 \
+    '{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":1000000,"cache_creation_input_tokens":1000000}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"estimated 11.75"* ]]
+}
+
+@test "claude: a 1-hour cache write is priced at twice base input" {
+  seed_cc_title cc-alpha ses_p3 "Long cache"
+  seed_cc_prompt cc-alpha ses_p3 /work/alpha 2026-08-19 "cost me"
+  # models.dev carries only the 5-minute write rate (6.25 for opus-5). A write
+  # tagged 1h is charged at twice base input instead, so 1M costs 10.00.
+  seed_cc_usage cc-alpha ses_p3 /work/alpha 2026-08-19 claude-opus-5 msg_p3 \
+    '{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_1h_input_tokens":1000000,"ephemeral_5m_input_tokens":0}}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"estimated 10.00"* ]]
+}
+
+@test "claude: a cache write with no TTL split falls back to the models.dev rate" {
+  seed_cc_title cc-alpha ses_p4 "Old transcript"
+  seed_cc_prompt cc-alpha ses_p4 /work/alpha 2026-08-19 "cost me"
+  seed_cc_usage cc-alpha ses_p4 /work/alpha 2026-08-19 claude-opus-5 msg_p4 \
+    '{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"estimated 6.25"* ]]
+}
+
+@test "claude: thinking tokens are not charged on top of output tokens" {
+  seed_cc_title cc-alpha ses_p5 "Thought hard"
+  seed_cc_prompt cc-alpha ses_p5 /work/alpha 2026-08-19 "cost me"
+  # thinking_tokens are a subset of output_tokens: 1M output with 400k of it
+  # thinking is still 25.00, not 35.00.
+  seed_cc_usage cc-alpha ses_p5 /work/alpha 2026-08-19 claude-opus-5 msg_p5 \
+    '{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens_details":{"thinking_tokens":400000}}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"estimated 25.00"* ]]
+}
+
+@test "claude: a model with no published rate is named and left out of the total" {
+  seed_cc_title cc-alpha ses_p6 "Unknown model"
+  seed_cc_prompt cc-alpha ses_p6 /work/alpha 2026-08-19 "cost me"
+  seed_cc_usage cc-alpha ses_p6 /work/alpha 2026-08-19 claude-opus-5 msg_p6a \
+    '{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
+  seed_cc_usage cc-alpha ses_p6 /work/alpha 2026-08-19 claude-mystery-9 msg_p6b \
+    '{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"estimated 25.00"* ]]
+  [[ "$output" == *"pricing-note: no models.dev rate for claude-mystery-9"* ]]
+}
+
+@test "claude: a priced week names no unpriced models" {
+  seed_cc_week
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"pricing-note:"* ]]
+}
+
+@test "claude: breakdowns gain a cost column when a rate table is loaded" {
+  seed_cc_title cc-alpha ses_p7 "Priced breakdown"
+  seed_cc_prompt cc-alpha ses_p7 /work/alpha 2026-08-19 "cost me"
+  seed_cc_usage cc-alpha ses_p7 /work/alpha 2026-08-19 claude-opus-5 msg_p7 \
+    '{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"est cost"* ]]
+  [[ "$output" == *"25.00     1000000  claude-opus-5"* ]]
+  [[ "$output" == *"25.00     1000000  /work/alpha"* ]]
+}
+
+@test "claude: a session block carries its own estimated cost" {
+  seed_cc_title cc-alpha ses_p8 "Session cost"
+  seed_cc_prompt cc-alpha ses_p8 /work/alpha 2026-08-19 "cost me"
+  seed_cc_usage cc-alpha ses_p8 /work/alpha 2026-08-19 claude-opus-5 msg_p8 \
+    '{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cost: (estimated 25.00, session and subagents)"* ]]
+}
+
+@test "claude: a session cost includes its subagents" {
+  seed_cc_title cc-alpha ses_p9 "Delegated cost"
+  seed_cc_prompt cc-alpha ses_p9 /work/alpha 2026-08-19 "delegate this"
+  seed_cc_usage cc-alpha ses_p9 /work/alpha 2026-08-19 claude-opus-5 msg_p9 \
+    '{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}'
+  # The subagent seeder writes haiku at 5 per million output: 1M more output
+  # there takes the session from 25.00 to 30.00 while its own tokens stay put.
+  seed_cc_subagent cc-alpha ses_p9 ccc Explore /work/alpha 2026-08-19 1000000
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cost: (estimated 30.00, session and subagents)"* ]]
+}
+
+@test "claude: --no-pricing restores the no-cost-recorded line and the plain breakdowns" {
+  seed_cc_week
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude --no-pricing
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cost: (unavailable: Claude Code transcripts record no cost; no estimate: --no-pricing)"* ]]
+  [[ "$output" != *"est cost"* ]]
+  [[ "$output" != *"estimated"* ]]
+}
+
+@test "claude: a missing pricing file is reported as the reason for no estimate" {
+  seed_cc_week
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude \
+    --pricing "$BATS_TEST_TMPDIR/absent.json"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no estimate: no such pricing file:"* ]]
+}
+
+@test "claude: a pricing file carrying no anthropic rates is reported, not guessed" {
+  seed_cc_week
+  printf '{"openai":{"models":{}}}' > "$BATS_TEST_TMPDIR/empty-rates.json"
+  run "$WD" --from 2026-08-17 --to 2026-08-23 --no-gh --source claude \
+    --pricing "$BATS_TEST_TMPDIR/empty-rates.json"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no estimate: no anthropic rates in"* ]]
 }
 
 @test "claude: stats break output tokens down by model and by repo" {

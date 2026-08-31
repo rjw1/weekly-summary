@@ -41,6 +41,12 @@ traps in particular:
 ~/git/rjw1/weekly-summary/bin/weekly-digest --weeks-ago 1
 ```
 
+Claude Code pricing comes from a models.dev table cached under
+`~/.cache/weekly-digest/`, refreshed when it is more than 30 days old. A run
+with no network and no cache still works: it reports the Claude Code cost as
+unavailable with the reason. `--no-pricing` skips the estimate deliberately,
+and `--pricing FILE` prices from a local models.dev `api.json`.
+
 Add `--source opencode`, `--source claude` or `--source gemini` to restrict the
 report to one tool. The default is `all` — `both` is still accepted as an alias
 for it — and that is what a weekly review normally wants, since work routinely
@@ -71,6 +77,8 @@ the digest.
 - `## window` — state the resolved dates in the report header.
 - `## stats` — one `###` block per tool: in-window cost and tokens, plus
   a per-repo breakdown, and (for claude-code and gemini-cli) a per-model one.
+  opencode's cost is metered; claude-code's is estimated from models.dev
+  pricing; gemini-cli's is unavailable. See below before quoting any of them.
 - `## pull requests` — see below. This section is tool-agnostic.
 - `## sessions` — one block per session, grouped by tool, opencode first, then
   claude-code, then gemini-cli, each group in chronological order. Every block
@@ -96,13 +104,47 @@ the file that came with it.
 
 ### What the tools record differently
 
-**Only opencode records cost.** Claude Code computes spend live from token
-usage and persists none; Gemini CLI records tokens and no cost either. Both
-stats blocks therefore read `cost: (unavailable: …)` with the reason given, and
-their breakdowns are in output tokens. Copy those reasons into the report rather
-than printing a zero, computing an estimate, or quietly implying the week was
-free. The opencode figure is a real cost and must not be presented as a total
-across the three tools.
+**Only opencode records a real cost.** Claude Code computes spend live from
+token usage and persists none; Gemini CLI records tokens and no cost either.
+The digest fills the Claude Code gap by pricing its recorded tokens against
+models.dev's published rates, so its stats block reads
+`cost: (estimated N from models.dev list API pricing, not a billed amount)`
+with a `pricing:` line naming the table and its date. Gemini CLI is still
+unpriced and reads `cost: (unavailable: …)`.
+
+**An estimate is never a charge, and the report must never let it read as one.**
+Two things make the figure notional rather than billed: it applies list API
+prices, which is not what a subscription plan charges, and it prices only the
+tokens the transcripts recorded. Always attach the word *estimated* and the
+models.dev attribution to the Claude Code figure. The opencode figure is real
+metered spend. A combined week total is allowed, but only if it says plainly
+that it adds metered opencode spend to an estimate — never present the sum as
+one measured number.
+
+A `pricing-note:` line names models the table had no rate for. Their tokens are
+outside the estimate, so say so: the total is a floor, not a complete figure.
+
+If the Claude Code cost reads `(unavailable: … no estimate: …)`, the rate table
+could not be had — offline, `--no-pricing`, or a bad `--pricing` file. Copy the
+reason into the report rather than printing a zero, substituting your own
+arithmetic, or quietly implying the week was free.
+
+Cost figures appear in three places: the stats total, a cost column on the
+per-model and per-repo breakdowns (both then sorted by cost rather than output
+tokens), and each claude-code session block's
+`cost: (estimated N, session and subagents)`. That last one covers the session
+and its subagents together, matching how an opencode root session totals its
+children, so the two tools' per-session figures can be ranked side by side —
+with opencode's real and Claude Code's estimated.
+
+**Never add the claude-code session costs up.** Resuming a session writes a new
+transcript that repeats the earlier records, so one message can appear in
+several session files — 264 of them did in a single real week, and the session
+figures for that week summed about 4% above the true total. The `## stats`
+figure deduplicates by message id across every file at once and is the only
+correct week total; the per-session figures are for ranking sessions against
+each other, nothing more. The same caveat applies to the per-session token
+counts, which have always overlapped the same way.
 
 **The three tools count cache tokens differently, so the `input=` figures are
 not the same measurement.** gemini-cli's `cached` is contained within its
@@ -158,8 +200,9 @@ Required sections:
 2. Themed narrative of the work
 3. Pull request table with current state
 4. Outstanding / needs attention
-5. Stats — keep the three tools' figures distinct, and carry across the
-   reasons Claude Code and Gemini CLI report no cost
+5. Stats — keep the three tools' figures distinct. Label the Claude Code cost
+   an estimate and name models.dev as its basis wherever it appears, and carry
+   across the reason Gemini CLI reports no cost
 6. Per-session appendix
 
 ### Narrative rules
