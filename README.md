@@ -12,9 +12,49 @@ It reads three histories:
 
 ## Running it
 
+`bin/weekly-digest` prints the facts and nothing else:
+
 ```bash
 bin/weekly-digest --weeks-ago 1
 ```
+
+`bin/weekly-report` writes the report itself, by running the skill headlessly
+through the Claude Code CLI. Output goes to `~/weekly-summaries/`:
+
+```bash
+bin/weekly-report                    # last complete Monday-to-Sunday week
+bin/weekly-report --weeks-ago 3
+bin/weekly-report --week 2026-08-10  # the week containing that day
+```
+
+Run by hand it asks before overwriting an existing report, since one may have
+notes added after it was generated; `--force` skips the question.
+
+Symlink it onto `PATH` (`ln -s "$PWD/bin/weekly-report" ~/bin/weekly-report`) to
+run it as a bare command. Reading a whole week of history costs real money on a
+busy week; the digest alone costs nothing.
+
+### Running it daily
+
+`--auto` makes the script safe to call from a daily cron and still produce one
+report a week:
+
+```bash
+weekly-report --auto
+```
+
+One rule covers every day, with no Monday special case: it writes when the
+report is missing, or was last written before this week's Monday. Later in the
+week that means the Monday run did not happen; on the Monday itself it means
+the report has not been written today, so calling it twice in a day writes
+once. A stale mid-week draft written before the week closed is replaced, while
+a report edited by hand during the week keeps a current timestamp and is left
+alone. When it decides there is nothing to do it exits silently unless run from
+a terminal, so a daily job does not mail a line every day of the week it
+correctly did nothing.
+
+`--auto` refuses `--week` and `--weeks-ago`: "is a report due today" only means
+anything for the week that has just ended.
 
 ## Cost
 

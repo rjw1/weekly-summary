@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+#
+# weekly-report — write up a past week's work, once.
+#
+# bin/weekly-digest only extracts facts; the report itself is prose written
+# from them, so this is a headless Claude Code run of the weekly-summary skill
+# rather than a shell pipeline. The report lands in ~/weekly-summaries/.
+#
+# --auto exists so a daily cron can call this every day and still produce one
+# report a week: it writes on a Monday, and on any other day only if that
+# Monday's run did not happen. Run by hand it asks before overwriting, because
+# a report may carry notes typed in afterwards.
+
+set -euo pipefail
+
+PROGRAM="${0##*/}"
+REPORT_DIR="${WEEKLY_REPORT_DIR:-$HOME/weekly-summaries}"
+WEEKS_AGO=1
+WEEK_DATE=""
+TODAY=""
+AUTO=0
+FORCE=0
+
+die() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<USAGE
+usage: $PROGRAM [options]
+
+  --auto            write only when a report is due (for a daily cron): when
+                    the report is missing, or was last written before this
+                    Monday. Never asks, and never rewrites a report already
+                    written this week -- including a second run the same day.
+  --force           write without asking, even over an existing report
+  --weeks-ago N     the week N complete weeks back (default 1, i.e. last week)
+  --week DATE       the Monday-to-Sunday week containing DATE (YYYY-MM-DD)
+  --today DATE      pin "today", for tests
+  --help            show this
+
+Run with no options it writes up the last complete Monday-to-Sunday week. If
+that report already exists it asks before overwriting, since a report may have
+notes added by hand after it was generated.
+
+The report is written to $REPORT_DIR/week-of-<monday>.md. Reading a whole week
+of session history costs real money on a busy week; bin/weekly-digest on its
+own is free, and is enough when only the facts are wanted.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --auto)      AUTO=1; shift ;;
+    --force)     FORCE=1; shift ;;
+    --weeks-ago) WEEKS_AGO="${2:?--weeks-ago needs a value}"; shift 2 ;;
+    --week)      WEEK_DATE="${2:?--week needs a date}"; shift 2 ;;
+    --today)     TODAY="${2:?--today needs a date}"; shift 2 ;;
+    --help|-h)   usage; exit 0 ;;
+    *)           die "unknown option: $1" ;;
+  esac
+done
+
+case "$WEEKS_AGO" in ''|*[!0-9]*) die "--weeks-ago must be a whole number: $WEEKS_AGO" ;; esac
+[ "$AUTO" -eq 0 ] || [ "$FORCE" -eq 0 ] || die "--auto and --force contradict each other"
+
+# --auto answers "is a report due today", which only means anything for the week
+# that just ended. Asking it about an arbitrary past week has no sensible answer,
+# so it is refused rather than guessed at.
+if [ "$AUTO" -eq 1 ] && { [ -n "$WEEK_DATE" ] || [ "$WEEKS_AGO" -ne 1 ]; }; then
+  die "--auto only applies to the last complete week; drop --week/--weeks-ago"
+fi
+
+command -v claude >/dev/null 2>&1 ||
+  die "claude is not installed; this needs the Claude Code CLI on PATH"
+command -v sqlite3 >/dev/null 2>&1 ||
+  die "sqlite3 is not installed; it is needed for the calendar arithmetic"
+
+# Dates are validated for shape before they reach sqlite, so a stray quote is
+# caught here rather than leaking out as a sqlite parse error, and never
+# reaches a query as anything but a checked YYYY-MM-DD.
+valid_date() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# sqlite does the calendar arithmetic rather than date(1): BSD and GNU date
+# disagree about relative offsets, and weekly-digest already depends on sqlite3
+# for exactly this reason. date() also rolls an impossible date forward
+# silently -- 2026-02-30 becomes 2026-03-02 -- so a round trip catches that.
+sq() { sqlite3 :memory: "$1"; }
+
+calendar_date() {
+  [ "$(sq "SELECT date('$1');")" = "$1" ]
+}
+
+check_date() {
+  valid_date "$2" || die "$1 must be a YYYY-MM-DD date: $2"
+  calendar_date "$2" || die "$1 is not a real date: $2"
+}
+
+[ -z "$WEEK_DATE" ] || check_date --week "$WEEK_DATE"
+[ -z "$TODAY" ] || check_date --today "$TODAY"
+
+[ -n "$TODAY" ] || TODAY="$(sq "SELECT date('now','localtime');")"
+
+# Monday of the week containing a date. sqlite's %w is 0 for Sunday, so the
+# shift back to Monday is (%w + 6) % 7 rather than %w - 1.
+monday_of() {
+  sq "SELECT date('$1', '-' || ((CAST(strftime('%w','$1') AS INTEGER) + 6) % 7) || ' days');"
+}
+
+THIS_MONDAY="$(monday_of "$TODAY")"
+
+if [ -n "$WEEK_DATE" ]; then
+  TARGET_MONDAY="$(monday_of "$WEEK_DATE")"
+else
+  TARGET_MONDAY="$(sq "SELECT date('$THIS_MONDAY','-$((7 * WEEKS_AGO)) days');")"
+fi
+
+REPORT="$REPORT_DIR/week-of-$TARGET_MONDAY.md"
+
+# Interactive runs say why nothing happened; a cron run stays silent so it does
+# not mail a line every day of the week it correctly did nothing.
+note() {
+  [ -t 1 ] || return 0
+  printf '%s: %s\n' "$PROGRAM" "$1"
+}
+
+if [ "$AUTO" -eq 1 ]; then
+  # One rule covers every day of the week, with no Monday special case: write
+  # if the report is missing or was last written before this Monday. Later in
+  # the week that means "the Monday run did not happen"; on the Monday itself
+  # it means "not yet written today", which is what stops a second run the same
+  # day from regenerating a report that already exists. A report edited by hand
+  # during the week keeps a current mtime and is therefore left alone, and a
+  # stale mid-week draft written before the week closed is correctly replaced.
+  if [ -f "$REPORT" ]; then
+    written="$(date -r "$REPORT" +%Y-%m-%d)"
+    if ! [ "$written" \< "$THIS_MONDAY" ]; then
+      note "$REPORT was written on $written; nothing to do"
+      exit 0
+    fi
+  fi
+elif [ "$FORCE" -eq 0 ] && [ -f "$REPORT" ]; then
+  printf '%s: %s already exists. Overwrite? [y/N] ' "$PROGRAM" "$REPORT"
+  if ! IFS= read -r reply; then
+    printf '\n'
+    die "cannot ask: stdin is not readable; use --force, or --auto for a cron"
+  fi
+  case "$reply" in
+    y|Y|yes|Yes|YES) ;;
+    *) note "leaving $REPORT unchanged"; exit 0 ;;
+  esac
+fi
+
+# The week is handed over as an explicit date rather than "last week": the
+# skill itself warns that "last week" read on a Monday is ambiguous, and an
+# unattended run has nobody to ask.
+exec claude -p "/weekly-summary week of $TARGET_MONDAY"
