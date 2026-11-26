@@ -40,6 +40,7 @@ PRICING_FILE="${WEEKLY_DIGEST_PRICING:-}"
 PRICING_CACHE="${WEEKLY_DIGEST_PRICING_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/weekly-digest/models-dev.json}"
 PRICING_MAX_AGE_DAYS=30
 USE_PRICING=1
+TIMESTAMPS=0
 
 # Populated once by claude_rates, which is why RATES_TRIED exists separately:
 # an empty RATES_JSON is also the outcome when pricing is unavailable, so it
@@ -98,6 +99,7 @@ usage: weekly-digest [options]
   --source WHICH    opencode | claude | gemini | all (default all)
   --no-gh           skip the pull request lookup
   --no-pricing      skip the Claude Code cost estimate
+  --timestamps      append the local time of every in-window record, per session
   --pricing FILE    price from a local models.dev api.json instead of fetching
   --max-chars N     truncate prompts and messages (default 900)
   --today DATE      pin "today", for tests
@@ -121,6 +123,7 @@ parse_args() {
       --source)    SOURCE="${2:?--source needs a value}"; shift 2 ;;
       --no-gh)     USE_GH=0; shift ;;
       --no-pricing) USE_PRICING=0; shift ;;
+      --timestamps) TIMESTAMPS=1; shift ;;
       --pricing)   PRICING_FILE="${2:?--pricing needs a path}"; shift 2 ;;
       --help|-h)   usage; exit 0 ;;
       *)           die "unknown option: $1" ;;
@@ -402,6 +405,7 @@ emit_stats() {
 # shellcheck disable=SC2016
 JQ_DEFS='
 def lday: sub("\\.[0-9]+Z$";"Z") | fromdateiso8601 | strflocaltime("%Y-%m-%d");
+def ltime: sub("\\.[0-9]+Z$";"Z") | fromdateiso8601 | strflocaltime("%H:%M:%S");
 def inwin($from;$to): ((.timestamp // "") | tostring) as $t
   | ($t != "") and (($t|lday) >= $from) and (($t|lday) <= $to);
 def clean: gsub("\r";"") | gsub("\n";" / ") | gsub("\t";" ");
@@ -722,6 +726,7 @@ emit_claude_session() {
 
   printf '### %s\n\n' "$title"
   printf 'tool: claude-code\n'
+  printf 'id: %s\n' "$(claude_sid "$file")"
   printf 'repo: %s\n' "$repo"
   [ -z "$branch" ] || printf 'branch: %s\n' "$branch"
   printf 'started: %s\n' "$started"
@@ -1011,25 +1016,24 @@ EOF
   printf '\n'
 }
 
-# Root sessions with any message inside the window. Walks up from each active
-# session to its root, so work done under a session started in an earlier week
-# is still attributed to this one.
-emit_sessions_opencode() {
-  local rows
-  rows="$(db_query <<SQL
-.timeout 5000
-.mode list
-.separator |
--- The up root-walk CTE below is duplicated in emit_stats and must stay
--- identical there, or the session list and its counts will silently
--- disagree about which sessions reach a root. active differs from
--- emit_stats' version: it is a bare message scan with no join to session,
--- because the up walk below already excludes a session_id with no matching
--- session row (the first recursive step's JOIN session c ON c.id = u.anc
--- has nothing to match). emit_stats also defines a reachable CTE with no
--- counterpart here: roots below already implies "reached a root" for every
--- row it lists, so this function needs no separate leaf-reachability filter.
-WITH RECURSIVE
+# The active/up root walk shared by emit_sessions_opencode and
+# emit_timestamps_opencode, so the session list and the timestamps can never
+# disagree about which root a message belongs to.
+#
+# The up walk is duplicated in emit_stats and must stay identical there, or the
+# session list and its counts will silently disagree about which sessions reach
+# a root. active differs from emit_stats' version: it is a bare message scan
+# with no join to session, because the up walk already excludes a session_id
+# with no matching session row (the first recursive step's JOIN session c ON
+# c.id = u.anc has nothing to match). emit_stats also defines a reachable CTE
+# with no counterpart here: selecting on parent_id IS NULL already implies
+# "reached a root" for every row, so no separate leaf-reachability filter is
+# needed.
+#
+# printf rather than cat <<SQL: the "missing gh" test runs with a PATH holding
+# only bash, sqlite3, jq, find and sort.
+opencode_up_cte() {
+  printf '%s\n' "WITH RECURSIVE
   active AS (
     SELECT DISTINCT session_id AS id FROM message
     WHERE date(time_created/1000,'unixepoch','localtime')
@@ -1042,7 +1046,19 @@ WITH RECURSIVE
       FROM up u
       JOIN session c ON c.id = u.anc
       JOIN session p ON p.id = c.parent_id
-  ),
+  )"
+}
+
+# Root sessions with any message inside the window. Walks up from each active
+# session to its root, so work done under a session started in an earlier week
+# is still attributed to this one.
+emit_sessions_opencode() {
+  local rows
+  rows="$(db_query <<SQL
+.timeout 5000
+.mode list
+.separator |
+$(opencode_up_cte),
   roots AS (
     SELECT DISTINCT u.anc AS id
     FROM up u JOIN session s ON s.id = u.anc
@@ -1083,6 +1099,7 @@ SQL
     [ -n "$id" ] || continue
     printf '### %s\n\n' "$title"
     printf 'tool: opencode\n'
+    printf 'id: %s\n' "$id"
     printf 'repo: %s\n' "$repo"
     printf 'started: %s\n' "$started"
 
@@ -1314,6 +1331,7 @@ emit_gemini_session() {
 
   printf '### %s\n\n' "$title"
   printf 'tool: gemini-cli\n'
+  printf 'id: %s\n' "$(gemini_sid "$file")"
   printf 'repo: %s\n' "$repo"
   printf 'started: %s\n' "$started"
 
@@ -1408,6 +1426,86 @@ emit_sessions() {
   ! use_gemini   || emit_gemini_sessions
 }
 
+# Session ids as printed on each block's id: line and keyed on each timestamp
+# line; bin/timesheet joins the two on this string, so both must come from here.
+claude_sid() {
+  local base="${1##*/}"
+  printf '%s' "${base%.jsonl}"
+}
+
+# Matches the key gemini_index deduplicates on, so the id names the session
+# rather than whichever copy of it happened to be kept.
+gemini_sid() {
+  local sid
+  sid="$(jq -r '.sessionId // empty' "$1" 2>/dev/null)" || sid=""
+  printf '%s' "${sid:-$1}"
+}
+
+# ----------------------------------------------------------------------------
+# --timestamps: the local time of every in-window record, one line each as
+#   tool <TAB> session-id <TAB> HH:MM:SS
+# for bin/timesheet to turn into blocks of activity. Session selection is the
+# same as for the session blocks -- the same root walk, the same transcripts,
+# the same deduplicated Gemini copy -- so every id here has a block above.
+
+emit_timestamps_opencode() {
+  db_query <<SQL
+.timeout 5000
+.mode list
+$(opencode_up_cte)
+SELECT DISTINCT 'opencode' || char(9) || u.anc || char(9)
+       || time(m.time_created/1000,'unixepoch','localtime')
+FROM up u
+JOIN session s ON s.id = u.anc AND s.parent_id IS NULL
+JOIN message m ON m.session_id = u.leaf
+WHERE date(m.time_created/1000,'unixepoch','localtime')
+      BETWEEN '$WIN_FROM' AND '$WIN_TO'
+ORDER BY 1;
+SQL
+}
+
+# Subagent transcripts count towards their parent: the session was running
+# while they worked.
+emit_timestamps_claude() {
+  local _key file _rest sid sub
+  while IFS=$'\t' read -r _key file _rest; do
+    [ -n "$file" ] || continue
+    sid="$(claude_sid "$file")"
+    local group=("$file")
+    for sub in "${file%.jsonl}"/subagents/*.jsonl; do
+      [ -f "$sub" ] && group+=("$sub")
+    done
+    jq -rs --arg from "$WIN_FROM" --arg to "$WIN_TO" --arg sid "$sid" "
+      $JQ_DEFS
+      .[] | select(inwin(\$from;\$to))
+      | \"claude-code\t\" + \$sid + \"\t\" + (.timestamp | ltime)" \
+      "${group[@]}" 2>/dev/null ||
+      warn "claude-code: jq failed reading timestamps for $sid; they are omitted"
+  done < <(claude_index) | sort -u
+}
+
+emit_timestamps_gemini() {
+  local _key file _rest sid
+  while IFS=$'\t' read -r _key file _rest; do
+    [ -n "$file" ] || continue
+    sid="$(gemini_sid "$file")"
+    jq -r --arg from "$WIN_FROM" --arg to "$WIN_TO" --arg sid "$sid" "
+      $JQ_DEFS
+      .messages[]? | select(inwin(\$from;\$to))
+      | \"gemini-cli\t\" + \$sid + \"\t\" + (.timestamp | ltime)" \
+      "$file" 2>/dev/null ||
+      warn "gemini-cli: jq failed reading timestamps for $sid; they are omitted"
+  done < <(gemini_index) | sort -u
+}
+
+emit_timestamps() {
+  printf '## timestamps\n\n'
+  ! use_opencode || emit_timestamps_opencode
+  ! use_claude   || emit_timestamps_claude
+  ! use_gemini   || emit_timestamps_gemini
+  printf '\n'
+}
+
 main() {
   parse_args "$@"
   # sqlite3 is required unconditionally: the window arithmetic and the date
@@ -1436,6 +1534,7 @@ EOF
   emit_stats
   emit_prs
   emit_sessions
+  [ "$TIMESTAMPS" -eq 0 ] || emit_timestamps
 }
 
 main "$@"
