@@ -56,6 +56,50 @@ correctly did nothing.
 `--auto` refuses `--week` and `--weeks-ago`: "is a report due today" only means
 anything for the week that has just ended.
 
+## Timesheet
+
+`bin/timesheet` estimates one day's working time for filling in a timesheet at
+the end of the day. It defaults to today, up to the moment it runs:
+
+```bash
+bin/timesheet                     # today so far
+bin/timesheet --date 2026-11-20   # a day that got missed
+bin/timesheet --no-label          # skip Claude, group by repo
+```
+
+It prints a line per client plus one for internal work, each with the raw time
+and the time rounded up to the next 30 minutes, the day total against the
+contracted day, minutes outside working hours, and one line per session with a
+short description.
+
+Working hours and the contracted day are read from
+`~/.config/timesheet/config` (or `$TIMESHEET_CONFIG`), kept outside the repo
+because they are personal:
+
+```
+hours=09:00-17:30
+day=7:30
+```
+
+Either line may be left out; the values above are the defaults, and the report
+says when it is using them. The file is parsed, never sourced.
+
+Every figure is a **floor**. Only time with an agent session running is seen:
+messages up to 15 minutes apart (`--gap`) count as one block of work, and each
+block runs 5 minutes past its last message (`--tail`). Meetings, Slack and
+reading leave no trace, so the "not seen" line is what is left to account for
+from the calendar.
+
+The minutes all come from the script. A headless `claude -p` run, with no tools,
+only labels each session as client, internal or personal and writes its
+description. Personal sessions are listed but never totalled. If the reply
+leaves a session unlabelled or invents a category, the run stops rather than
+printing a timesheet with a gap in it; `--no-label` avoids the call entirely.
+The labelling call costs a little; `--no-label` costs nothing.
+
+Symlink it onto `PATH` like `weekly-report`:
+`ln -s "$PWD/bin/timesheet" ~/bin/timesheet`.
+
 ## Cost
 
 opencode records what a session cost; Claude Code and Gemini CLI do not. The

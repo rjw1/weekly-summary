@@ -665,6 +665,89 @@ EOF
   [[ "$output" != *'immutable'* ]]
 }
 
+# --- session ids and the --timestamps section --------------------------------
+#
+# bin/timesheet keys its arithmetic on these, so the id printed in a session
+# block and the id on a timestamp line must be the same string for each tool.
+
+@test "ids: each session block names its id directly after its tool line" {
+  seed_project "$WEEKLY_DIGEST_DB" proj1 /work/alpha
+  seed_session "$WEEKLY_DIGEST_DB" ses_a - proj1 "Opencode work" 2026-08-18 0
+  seed_message "$WEEKLY_DIGEST_DB" ses_a user 2026-08-18 0 "hello"
+  seed_cc_prompt cproj cc-sid-1 /work/beta 2026-08-18 "claude prompt"
+  seed_gemini_session gproj gem-sid-1 2026-08-18 "[$(gmsg_user 2026-08-18 'gemini prompt')]"
+  run "$WD" --from 2026-08-18 --to 2026-08-18 --no-gh --no-pricing
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'tool: opencode\nid: ses_a\n'* ]]
+  [[ "$output" == *$'tool: claude-code\nid: cc-sid-1\n'* ]]
+  [[ "$output" == *$'tool: gemini-cli\nid: gem-sid-1\n'* ]]
+}
+
+@test "timestamps: absent unless asked for" {
+  seed_cc_prompt cproj cc-sid-1 /work/beta 2026-08-18 "claude prompt"
+  run "$WD" --from 2026-08-18 --to 2026-08-18 --no-gh --no-pricing
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"## timestamps"* ]]
+}
+
+@test "timestamps: one local time per record, keyed by tool and id" {
+  seed_cc_prompt cproj cc-sid-1 /work/beta 2026-08-18 "claude prompt" typed human 09:58:00
+  seed_cc_assistant cproj cc-sid-1 /work/beta 2026-08-18 claude-opus-5 50 m1 "answer" 10:03:30
+  run "$WD" --from 2026-08-18 --to 2026-08-18 --no-gh --no-pricing --timestamps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'## timestamps\n\nclaude-code\tcc-sid-1\t09:58:00\nclaude-code\tcc-sid-1\t10:03:30'* ]]
+}
+
+@test "timestamps: out-of-window records are excluded" {
+  seed_cc_prompt cproj cc-sid-1 /work/beta 2026-08-17 "yesterday" typed human 16:00:00
+  seed_cc_prompt cproj cc-sid-1 /work/beta 2026-08-18 "today" typed human 11:00:00
+  run "$WD" --from 2026-08-18 --to 2026-08-18 --no-gh --no-pricing --timestamps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'claude-code\tcc-sid-1\t11:00:00'* ]]
+  [[ "$output" != *"16:00:00"* ]]
+}
+
+@test "timestamps: subagent and child-session records belong to the parent" {
+  seed_project "$WEEKLY_DIGEST_DB" proj1 /work/alpha
+  seed_session "$WEEKLY_DIGEST_DB" ses_root - proj1 "Root" 2026-08-18 0
+  seed_session "$WEEKLY_DIGEST_DB" ses_kid ses_root proj1 "Kid" 2026-08-18 0
+  seed_message "$WEEKLY_DIGEST_DB" ses_root user 2026-08-18 0 "root prompt" 10:00:00
+  seed_message "$WEEKLY_DIGEST_DB" ses_kid assistant 2026-08-18 0 "kid work" 10:20:00
+  seed_cc_prompt cproj cc-sid-1 /work/beta 2026-08-18 "claude prompt" typed human 10:30:00
+  seed_cc_subagent cproj cc-sid-1 agent1 general-purpose /work/beta 2026-08-18 10 11:00:00
+  run "$WD" --from 2026-08-18 --to 2026-08-18 --no-gh --no-pricing --timestamps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'opencode\tses_root\t10:20:00'* ]]
+  [[ "$output" != *$'\tses_kid\t'* ]]
+  [[ "$output" == *$'claude-code\tcc-sid-1\t11:00:00'* ]]
+}
+
+@test "timestamps: a duplicated gemini session contributes only the kept copy" {
+  # The copies differ, so sort -u alone could not make this pass: only the
+  # dedup keeping the fuller copy (gproj-b, two messages) does.
+  seed_gemini_session gproj-a gem-dup 2026-08-18 "[$(gmsg_user 2026-08-18 'p' 09:30:00)]"
+  seed_gemini_session gproj-b gem-dup 2026-08-18 \
+    "[$(gmsg_user 2026-08-18 'p' 10:00:00),$(gmsg_model 2026-08-18 gemini-2.5-pro 5 'a' 10:01:00)]"
+  run "$WD" --from 2026-08-18 --to 2026-08-18 --no-gh --no-pricing --timestamps
+  [ "$status" -eq 0 ]
+  local n
+  n="$(grep -c $'^gemini-cli\tgem-dup\t10:00:00$' <<<"$output")"
+  [ "$n" -eq 1 ]
+  [[ "$output" == *$'gemini-cli\tgem-dup\t10:01:00'* ]]
+  [[ "$output" != *"09:30:00"* ]]
+}
+
+@test "timestamps: local time is applied" {
+  seed_project "$WEEKLY_DIGEST_DB" proj1 /work/alpha
+  seed_session "$WEEKLY_DIGEST_DB" ses_a - proj1 "Opencode work" 2026-08-18 0
+  seed_message "$WEEKLY_DIGEST_DB" ses_a user 2026-08-18 0 "hello" 09:00:00
+  seed_cc_prompt cproj cc-sid-1 /work/beta 2026-08-18 "claude prompt" typed human 09:00:00
+  TZ=Europe/London run "$WD" --from 2026-08-18 --to 2026-08-18 --no-gh --no-pricing --timestamps
+  [ "$status" -eq 0 ]
+  [[ "$output" == *$'opencode\tses_a\t10:00:00'* ]]
+  [[ "$output" == *$'claude-code\tcc-sid-1\t10:00:00'* ]]
+}
+
 @test "database: a missing database is a clear error" {
   # Triggers SC2030/SC2031 on any later test reading WEEKLY_DIGEST_DB --
   # the linter models each @test as a subshell, so it's a lint-order
