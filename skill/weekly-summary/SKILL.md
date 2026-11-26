@@ -1,6 +1,6 @@
 ---
 name: weekly-summary
-description: Use when asked to summarise what was done last week, produce a weekly review, or write up a past week's work from opencode, Claude Code or Gemini CLI session history. Covers running the digest helper, resolving which week is meant, and what the written report must contain.
+description: Use when asked to summarise what was done last week, produce a weekly review, or write up a past week's work from opencode, Claude Code or Gemini CLI session history, and when asked how long was spent on something on a given day, for timesheet hours, or to fill in a timesheet. Covers running the digest and timesheet helpers, resolving which week is meant, and what the written report must contain.
 ---
 
 # Weekly summary
@@ -224,6 +224,36 @@ Required sections:
 Pull together, from the digest: pull requests still open and what they are
 waiting on, work described as committed but not pushed, and follow-ups deferred
 in the transcripts.
+
+## Timesheet hours for one day
+
+For "how long did I spend on X today", "fill in my timesheet" or "hours for
+Tuesday", run `bin/timesheet` (on `PATH` as `timesheet`) and relay what it
+prints. Do not answer from the digest:
+
+```bash
+~/git/rjw1/weekly-summary/bin/timesheet                     # today so far
+~/git/rjw1/weekly-summary/bin/timesheet --date 2026-11-24   # another day
+~/git/rjw1/weekly-summary/bin/timesheet --no-label          # by repo, no Claude call
+```
+
+- **Never redo its arithmetic or adjust its figures.** It owns the blocks, the
+  overlap handling and the rounding, the same way the digest owns the week.
+  Quote the rounded column as the figures to enter and the raw column beside
+  it.
+- **The figures are a floor.** Only time with an agent session running is
+  seen. Say so, and point at the "not seen" line as the time left to account
+  for from the calendar. Never pad a line towards the contracted day.
+- **Client and category labels are a model's judgement.** If the session list
+  shows one that is plainly wrong, say which and why rather than silently
+  moving its time; the user corrects it in the timesheet.
+- **Use `--no-label` when the question only needs repos,** or when the
+  labelling run fails. A failed label check prints no timesheet at all; copy
+  its reason to the user.
+- **Working hours and the contracted day come from
+  `~/.config/timesheet/config`.** A report headed "(defaults" means the file is
+  missing. Never write the user's hours into this repo or into a report that
+  could be committed.
 
 ## Data handling
 
